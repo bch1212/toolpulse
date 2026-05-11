@@ -96,12 +96,12 @@ async def search_web(query: str) -> dict:
               </tr>
             </thead>
             <tbody className="divide-y divide-gray-800">
-              <Row feature="Tool-level latency" tp ok lf ok hl ok az ok />
-              <Row feature="Schema drift detection" tp ok lf="—" hl="—" az="—" />
-              <Row feature="Synthetic health checks" tp ok lf="—" hl="—" az="—" />
-              <Row feature="MCP-native" tp ok lf="partial" hl="—" az="—" />
+              <Row feature="Tool-level latency" tp="✓" lf="✓" hl="✓" az="✓" />
+              <Row feature="Schema drift detection" tp="✓" lf="—" hl="—" az="—" />
+              <Row feature="Synthetic health checks" tp="✓" lf="—" hl="—" az="—" />
+              <Row feature="MCP-native" tp="✓" lf="partial" hl="—" az="—" />
               <Row feature="Free tier (calls/mo)" tp="100K" lf="50K" hl="100K" az="trial" />
-              <Row feature="Self-host" tp="roadmap" lf ok hl ok az="—" />
+              <Row feature="Self-host" tp="roadmap" lf="✓" hl="✓" az="—" />
             </tbody>
           </table>
         </div>
@@ -113,16 +113,14 @@ async def search_web(query: str) -> dict:
   );
 }
 
-function Row(props: any) {
-  const cell = (v: any) =>
-    v === undefined ? "—" : v === "ok" || v === true ? "✓" : v;
+function Row(props: { feature: string; tp: string; lf: string; hl: string; az: string }) {
   return (
     <tr>
       <td className="p-4 text-gray-300">{props.feature}</td>
-      <td className="p-4 text-accent">{cell(props.tp)}</td>
-      <td className="p-4 text-gray-400">{cell(props.lf)}</td>
-      <td className="p-4 text-gray-400">{cell(props.hl)}</td>
-      <td className="p-4 text-gray-400">{cell(props.az)}</td>
+      <td className="p-4 text-accent">{props.tp}</td>
+      <td className="p-4 text-gray-400">{props.lf}</td>
+      <td className="p-4 text-gray-400">{props.hl}</td>
+      <td className="p-4 text-gray-400">{props.az}</td>
     </tr>
   );
 }
