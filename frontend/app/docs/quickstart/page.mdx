@@ -1,0 +1,54 @@
+export const metadata = {
+  title: "Quickstart",
+  description: "Install ToolPulse, add the @monitor decorator, see calls in the dashboard within 60 seconds.",
+};
+
+# Quickstart
+
+## 1. Install
+
+```bash
+pip install toolpulse
+# or
+npm install toolpulse
+```
+
+## 2. Get an API key
+
+[Sign in](/dashboard) — your first API key is auto-issued and shown once.
+
+```bash
+export TOOLPULSE_API_KEY=tp_live_xxxxxxxxxxxxx
+```
+
+## 3. Wrap a tool
+
+```python
+from toolpulse import monitor
+
+@monitor(tool_name="search_web", agent_id="my-agent")
+async def search_web(query: str) -> dict:
+    # your existing code, unchanged
+    ...
+```
+
+## 4. Run your agent
+
+That's it. Every call is recorded. Open the [dashboard](/dashboard) to see latency
+and success rate per tool, drift events as they happen, and recent calls with
+their response shapes.
+
+## 5. Configure alerts (optional)
+
+Add a Discord, Slack, or webhook alert channel from the dashboard, then drift
+events and synthetic-check failures will fan out to all configured channels.
+
+```python
+# Or wrap a whole MCP server in one line:
+from mcp.server.fastmcp import FastMCP
+from toolpulse import wrap_mcp_server
+
+mcp = FastMCP("my-server")
+# ... register your tools ...
+wrap_mcp_server(mcp, agent_id="my-mcp-server")
+```

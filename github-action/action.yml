@@ -1,0 +1,39 @@
+name: "ToolPulse Health Check"
+description: "Probe an MCP server or HTTP tool endpoint and fail the workflow if it's degraded or has drifted."
+author: "ToolPulse"
+branding:
+  icon: "activity"
+  color: "purple"
+
+inputs:
+  endpoint:
+    description: "The URL of the tool or MCP server to probe."
+    required: true
+  type:
+    description: "Probe type: 'http' (any HTTP endpoint) or 'mcp' (call tools/list against an MCP server)."
+    required: false
+    default: "mcp"
+  expected-shape:
+    description: "Optional shape fingerprint to assert. If set, the action fails when the response shape doesn't match."
+    required: false
+  api-key:
+    description: "Optional ToolPulse API key. If set, the result is also reported to your dashboard."
+    required: false
+  fail-on-drift:
+    description: "If 'true' (default), the action fails when the response shape differs from `expected-shape`."
+    required: false
+    default: "true"
+
+outputs:
+  ok:
+    description: "true if the probe succeeded, false otherwise."
+  latency-ms:
+    description: "Probe latency in milliseconds."
+  shape-fingerprint:
+    description: "16-char SHA-256 fingerprint of the response shape."
+  status:
+    description: "HTTP status code returned by the endpoint (when applicable)."
+
+runs:
+  using: "node20"
+  main: "scripts/main.js"

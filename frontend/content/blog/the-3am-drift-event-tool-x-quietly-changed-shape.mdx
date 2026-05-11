@@ -1,0 +1,62 @@
+---
+title: "The 3am drift event: how a popular search API quietly changed shape and what we caught"
+slug: "the-3am-drift-event-tool-x-quietly-changed-shape"
+date: "2026-04-25"
+description: "A real drift event from our own monitored agent stack. A search tool added a new top-level field, removed an inner one, and our agent started giving worse answers — for two hours, until the alert fired."
+category: "case-study"
+tags: ["case-study", "drift", "real-failure"]
+author: "ToolPulse"
+generatedBy: "content-engine v1"
+---
+
+This is a real drift event captured by our own monitoring on our own production agent stack. We've redacted the third-party service name; the dynamics here apply to any tool you depend on.
+
+## The setup
+
+We run a research agent that calls a third-party search API roughly 2,000 times a day. The agent reads the search results, picks the most relevant URL, and feeds it to a downstream summarization step. The whole chain has been stable for months.
+
+## The drift
+
+At 3:14 AM Pacific, ToolPulse fired a `schema_drift` alert into our on-call Discord:
+
+> ⚠️ Tool `external_search` response shape changed. Baseline `4f3a98c1…` → New `7d201bcc…`.
+> Added: `results[].source_quality_score` (float). Removed: `results[].snippet`. Your agent may now be acting on unexpected data.
+
+Two changes in one deploy: a new field added (a quality score we didn't know was being launched), and an existing field renamed away (`snippet` → `summary`, but only the rename happened — `snippet` was just dropped).
+
+## What broke
+
+The agent's prompt template included the line *"Read each result's snippet and pick the one most relevant to the query."* With `snippet` now `null` for every result, the model was being asked to pick the best snippet from a list of nothings.
+
+The model didn't crash. It didn't error. It just picked the first result every time, because nothing distinguished them anymore. Quality of the eventual summary dropped — measurably, in our internal eval — but no exception was thrown anywhere in the chain.
+
+Without ToolPulse, we would have noticed this on Monday when someone looked at the eval dashboard and asked "why did our quality score drop on Friday?" and started digging.
+
+## What ToolPulse caught
+
+Three signals, in order:
+
+1. **The drift alert at 3:14 AM** — the structural change itself, with a useful diff.
+2. **Latency baseline unchanged** — the API was as fast as ever, ruling out outage.
+3. **Success rate unchanged** — every call returned 200, ruling out auth/quota issues.
+
+The combination pointed straight at "the API changed shape and we need to update our prompt." Total time to fix from alert: ~12 minutes, most of which was reading the API's release notes.
+
+## What we changed
+
+Two things on our side:
+
+- Updated the prompt template to use `summary` instead of `snippet` (since the new field map made it clear what they renamed).
+- Added the new `source_quality_score` to a follow-up alert: any time a tool we monitor *adds* a high-signal field, surface it in the alert so we can decide whether to use it.
+
+Both changes shipped within the hour. By the time the team woke up, the agent was back to baseline quality.
+
+## What this argues for
+
+Two specific things, beyond the obvious "monitor your tools":
+
+**Monitor at the tool layer, not just the LLM layer.** Prompt traces would have told us "the model picked the first result." Tool-call monitoring told us *why*: the input to the prompt was no longer the input the prompt was written for.
+
+**Alert on shape, not just on errors.** This whole event happened with a 100% success rate from the API. Anything that only watches HTTP status codes would have caught nothing.
+
+If you want to try this on your own stack, the [free tier](/dashboard) covers 100K calls per month — enough for most small agent deployments to be fully monitored at no cost.

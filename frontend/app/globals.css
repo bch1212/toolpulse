@@ -1,0 +1,40 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: dark;
+}
+
+html, body {
+  background: #0a0e1a;
+  color: #e5e7eb;
+}
+
+a { color: #a5b4fc; }
+a:hover { color: #c4b5fd; }
+
+pre, code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, monospace;
+}
+
+pre {
+  background: #111827;
+  border: 1px solid #1f2937;
+  border-radius: 8px;
+  padding: 1rem;
+  overflow-x: auto;
+  font-size: 0.875rem;
+  line-height: 1.5;
+}
+
+.prose h2 { @apply text-2xl font-semibold mt-10 mb-4; }
+.prose h3 { @apply text-xl font-semibold mt-6 mb-3; }
+.prose p { @apply mb-4 leading-relaxed; }
+.prose ul { @apply list-disc list-inside mb-4 space-y-1; }
+.prose code:not(pre code) {
+  background: #1f2937;
+  padding: 0.125rem 0.375rem;
+  border-radius: 4px;
+  font-size: 0.85em;
+}

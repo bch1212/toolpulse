@@ -1,0 +1,63 @@
+---
+title: "ToolPulse vs Langfuse: when to pick which"
+slug: "toolpulse-vs-langfuse-when-to-pick-which"
+date: "2026-04-27"
+description: "Honest, side-by-side comparison: Langfuse for prompt traces and evals, ToolPulse for tool-call reliability and schema drift. Where they overlap, where they don't, which to choose."
+category: "comparison"
+tags: ["langfuse", "comparison", "observability"]
+author: "ToolPulse"
+generatedBy: "content-engine v1"
+---
+
+If you're building agents, you've probably looked at both Langfuse and ToolPulse. They're both "LLM observability" — but they're aimed at different layers of the stack, and which one fits depends on what's actually causing you pain.
+
+## The one-sentence summary
+
+**Langfuse** is a trace-and-eval platform: every LLM call, every prompt version, every chain hop, captured in a tree you can inspect.
+
+**ToolPulse** is tool-call reliability monitoring: every tool invocation gets latency, success/failure, and a fingerprint of the response shape, with alerts when that shape changes.
+
+Same broad space. Different center of gravity.
+
+## Where they overlap
+
+Both will:
+
+- Record the duration of an LLM call
+- Capture errors when something goes wrong
+- Give you a UI to look at recent activity
+- Offer free tiers generous enough to evaluate seriously
+
+For a prompt-engineering-heavy workflow — versioning prompts, comparing eval scores, debugging why one chain underperforms another — Langfuse's trace tree is mature and well-suited.
+
+## Where they diverge
+
+The split shows up the moment your agent's reliability problem isn't *the prompt*, it's *the tools the prompt depends on*.
+
+**Schema drift detection.** ToolPulse fingerprints the structural shape of every tool response (keys, types, nesting — not values). When that shape changes, you get an alert before the agent starts acting on data it didn't expect. Langfuse doesn't do this; you'd see the downstream symptom in a trace, not the upstream cause.
+
+**Synthetic health checks.** ToolPulse runs scheduled probes against your tools — every 5 minutes, every hour, your choice — and pages you when one starts failing. Langfuse is reactive: you see issues when traffic flows through them.
+
+**MCP-native.** ToolPulse ships `wrap_mcp_server()` that monitors every tool in a FastMCP server in one line. Langfuse has MCP adapters but they're more general LLM-trace shaped.
+
+**Self-host.** Langfuse has a strong self-host story today. ToolPulse self-host is on the roadmap, not shipped.
+
+## How to decide in 60 seconds
+
+Pick **Langfuse** if:
+- You're optimizing prompts, comparing eval runs, or want a rich trace tree
+- Self-hosting is a hard requirement today
+- Your reliability issues mostly look like "the model gave a worse answer this week"
+
+Pick **ToolPulse** if:
+- You're seeing silent tool failures — the agent ran fine, the user got bad output, and the trace doesn't make it obvious why
+- You're heavily MCP-based
+- You want proactive alerts when a tool degrades, not retroactive trace analysis
+
+## Use both?
+
+Plenty of teams do. Langfuse for the prompt/eval layer, ToolPulse for the tool/integration layer. They write to different surfaces and answer different questions; they don't really compete the way it might first look.
+
+## What this comparison won't tell you
+
+Pricing changes. Feature parity in this space is moving fast — both products ship regularly. We try to keep the [comparison page](/compare/langfuse) honest, but verify against the live product before you commit.

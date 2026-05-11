@@ -1,0 +1,51 @@
+{
+  "name": "toolpulse",
+  "version": "0.1.0",
+  "description": "Agent tool reliability monitoring — one-line wrapper for any tool, with schema drift detection and synthetic health checks.",
+  "main": "dist/index.js",
+  "module": "dist/index.mjs",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.mjs",
+      "require": "./dist/index.js"
+    }
+  },
+  "files": ["dist", "README.md", "LICENSE"],
+  "scripts": {
+    "build": "tsup src/index.ts --format cjs,esm --dts --clean",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "lint": "tsc --noEmit"
+  },
+  "keywords": [
+    "llm",
+    "agent",
+    "monitoring",
+    "observability",
+    "mcp",
+    "langchain",
+    "openai",
+    "anthropic",
+    "schema-drift",
+    "ai-agent"
+  ],
+  "author": "ToolPulse",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/toolpulse/toolpulse"
+  },
+  "homepage": "https://toolpulse.io",
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "tsup": "^8.0.0",
+    "typescript": "^5.4.0",
+    "vitest": "^1.6.0",
+    "@types/node": "^20.11.0"
+  }
+}

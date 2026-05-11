@@ -1,0 +1,26 @@
+name: content engine
+
+on:
+  schedule:
+    - cron: "0 13 * * 1"   # Mondays 13:00 UTC (~5am Pacific / 9am ET)
+  workflow_dispatch:
+
+jobs:
+  generate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - name: install
+        working-directory: content-engine
+        run: pip install -r requirements.txt
+      - name: run
+        working-directory: content-engine
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL_READONLY }}
+          GITHUB_TOKEN: ${{ secrets.CONTENT_ENGINE_PAT }}
+          GITHUB_REPO: ${{ github.repository }}
+          GITHUB_BRANCH: main
+        run: python generate.py
