@@ -1,0 +1,11 @@
+[build]
+builder = "RAILPACK"
+
+[deploy]
+# Run main.py — it activates the venv via shebang/imports, runs migrations, and starts uvicorn
+# python is on PATH because mise sets it; main.py reads PORT from os.getenv
+startCommand = "python main.py"
+healthcheckPath = "/health"
+healthcheckTimeout = 30
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 5
