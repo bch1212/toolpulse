@@ -5,6 +5,8 @@
 
 import { getPost, listPosts } from "@/lib/content";
 
+export const dynamic = "force-static";
+
 export async function generateStaticParams() {
   return listPosts().map((p) => ({ slug: p.frontmatter.slug }));
 }
