@@ -8,6 +8,7 @@ import { listPosts, COMPETITORS } from "@/lib/content";
 
 const SITE_URL = process.env.NEXT_PUBLIC_SITE_URL ?? "https://toolpulse.io";
 
+export const dynamic = "force-static";
 export const revalidate = 3600;
 
 export async function GET() {
