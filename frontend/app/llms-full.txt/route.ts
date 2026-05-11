@@ -7,6 +7,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { listPosts, COMPETITORS } from "@/lib/content";
 
+export const dynamic = "force-static";
 export const revalidate = 3600;
 
 export async function GET() {
