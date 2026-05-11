@@ -11,9 +11,6 @@ const nextConfig = {
   reactStrictMode: true,
   trailingSlash: false,
   images: { unoptimized: true },
-  experimental: {
-    mdxRs: true,
-  },
   async headers() {
     return [
       {
