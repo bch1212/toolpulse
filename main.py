@@ -25,8 +25,9 @@ def _run_migrations() -> None:
     """Apply pending Alembic migrations. Idempotent. Fail loud."""
     try:
         log.info("running alembic upgrade head")
+        # Use the same Python interpreter so we hit the venv's alembic
         result = subprocess.run(
-            ["alembic", "-c", "api/alembic.ini", "upgrade", "head"],
+            [sys.executable, "-m", "alembic", "-c", "api/alembic.ini", "upgrade", "head"],
             capture_output=True,
             text=True,
             check=False,
