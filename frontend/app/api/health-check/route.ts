@@ -1,12 +1,9 @@
 /**
- * Free MCP health-check API — no auth, no rate-limit-per-account
- * (rate-limited by edge in production). Probes the supplied URL and
- * returns latency + tool list + shape fingerprint.
+ * Free MCP health-check API — no auth, edge-runtime compatible (for Cloudflare Pages).
+ * Probes the supplied URL and returns latency + tool list + shape fingerprint.
  */
 
-import { createHash } from "node:crypto";
-
-export const runtime = "nodejs";
+export const runtime = "edge";
 
 export async function POST(req: Request) {
   let url = "";
@@ -42,10 +39,7 @@ export async function POST(req: Request) {
     } catch {}
 
     const tools = json?.result?.tools ?? [];
-    const fingerprint = createHash("sha256")
-      .update(JSON.stringify(extractShape(json)))
-      .digest("hex")
-      .slice(0, 16);
+    const fingerprint = await sha256Hex(JSON.stringify(extractShape(json)));
 
     return Response.json({
       ok: res.ok && !json?.error,
@@ -55,7 +49,7 @@ export async function POST(req: Request) {
       tools: Array.isArray(tools)
         ? tools.slice(0, 50).map((t: any) => ({ name: t.name, description: t.description }))
         : [],
-      shapeFingerprint: fingerprint,
+      shapeFingerprint: fingerprint.slice(0, 16),
       error: json?.error?.message,
     });
   } catch (e) {
@@ -65,6 +59,14 @@ export async function POST(req: Request) {
       error: e instanceof Error ? e.message : String(e),
     });
   }
+}
+
+async function sha256Hex(input: string): Promise<string> {
+  const buf = new TextEncoder().encode(input);
+  const hash = await crypto.subtle.digest("SHA-256", buf);
+  return Array.from(new Uint8Array(hash))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
 }
 
 function extractShape(obj: any): any {
