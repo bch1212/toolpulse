@@ -1,9 +1,7 @@
 // Cloudflare Pages Function — runs on the edge alongside the static site.
 // Replaces the Next.js route handler, since output: "export" doesn't allow API routes.
 
-interface Env {}
-
-export const onRequestPost: PagesFunction<Env> = async ({ request }) => {
+export const onRequestPost = async ({ request }: { request: Request }): Promise<Response> => {
   let url = "";
   try {
     const body = await request.json<{ url: string }>();
