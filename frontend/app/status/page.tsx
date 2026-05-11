@@ -1,11 +1,6 @@
-import type { Metadata } from "next";
+"use client";
 
-export const metadata: Metadata = {
-  title: "Public LLM Tool Status — live latency and uptime",
-  description:
-    "Live latency and success rate across popular LLM tools (OpenAI, Anthropic, Gemini, Mistral, search APIs) — measured in real time by ToolPulse on our own agent stack.",
-  alternates: { canonical: "/status" },
-};
+import { useEffect, useState } from "react";
 
 interface ToolRow {
   tool_name: string;
@@ -14,21 +9,17 @@ interface ToolRow {
   success_rate: number;
 }
 
-async function getStatus(): Promise<{ tools: ToolRow[]; as_of: string }> {
-  const url =
-    (process.env.NEXT_PUBLIC_API_URL ?? "https://api.toolpulse.io") +
-    "/public/status/summary";
-  try {
-    const r = await fetch(url, { next: { revalidate: 300 } });
-    if (!r.ok) throw new Error("status fetch failed");
-    return r.json();
-  } catch {
-    return { tools: [], as_of: new Date().toISOString() };
-  }
-}
+export default function StatusPage() {
+  const [data, setData] = useState<{ tools: ToolRow[]; as_of: string } | null>(null);
+  const [error, setError] = useState<string | null>(null);
 
-export default async function StatusPage() {
-  const { tools, as_of } = await getStatus();
+  useEffect(() => {
+    const apiUrl = process.env.NEXT_PUBLIC_API_URL ?? "https://api-production-2181.up.railway.app";
+    fetch(`${apiUrl}/public/status/summary`)
+      .then((r) => (r.ok ? r.json() : Promise.reject(`HTTP ${r.status}`)))
+      .then(setData)
+      .catch((e) => setError(String(e)));
+  }, []);
 
   return (
     <div className="max-w-5xl mx-auto px-6 py-16">
@@ -39,9 +30,11 @@ export default async function StatusPage() {
             Real measurements from our own agent stack. Updated every 5 minutes.
           </p>
         </div>
-        <div className="text-xs text-gray-500">
-          As of {new Date(as_of).toLocaleString()}
-        </div>
+        {data && (
+          <div className="text-xs text-gray-500">
+            As of {new Date(data.as_of).toLocaleString()}
+          </div>
+        )}
       </div>
 
       <div className="mt-10 rounded-xl border border-gray-800 overflow-hidden">
@@ -56,40 +49,36 @@ export default async function StatusPage() {
             </tr>
           </thead>
           <tbody className="divide-y divide-gray-800">
-            {tools.length === 0 ? (
-              <tr>
-                <td colSpan={5} className="p-8 text-center text-gray-500">
-                  Bootstrapping — first measurements publish within 24 hours of launch.
+            {!data && !error && (
+              <tr><td colSpan={5} className="p-8 text-center text-gray-500">Loading…</td></tr>
+            )}
+            {error && (
+              <tr><td colSpan={5} className="p-8 text-center text-gray-500">Status feed temporarily unavailable.</td></tr>
+            )}
+            {data && data.tools.length === 0 && (
+              <tr><td colSpan={5} className="p-8 text-center text-gray-500">
+                Bootstrapping — first measurements publish within 24 hours of launch.
+              </td></tr>
+            )}
+            {data && data.tools.map((t) => (
+              <tr key={t.tool_name}>
+                <td className="p-4 font-mono text-gray-300">{t.tool_name}</td>
+                <td className="p-4 text-gray-400">{t.calls_24h.toLocaleString()}</td>
+                <td className="p-4 text-gray-400">{t.avg_latency_ms} ms</td>
+                <td className="p-4 text-gray-400">{(t.success_rate * 100).toFixed(2)}%</td>
+                <td className="p-4">
+                  {t.success_rate > 0.99 ? <span className="text-green-400">✓ healthy</span>
+                   : t.success_rate > 0.95 ? <span className="text-yellow-400">⚠ degraded</span>
+                   : <span className="text-red-400">● outage</span>}
                 </td>
               </tr>
-            ) : (
-              tools.map((t) => (
-                <tr key={t.tool_name}>
-                  <td className="p-4 font-mono text-gray-300">{t.tool_name}</td>
-                  <td className="p-4 text-gray-400">{t.calls_24h.toLocaleString()}</td>
-                  <td className="p-4 text-gray-400">{t.avg_latency_ms} ms</td>
-                  <td className="p-4 text-gray-400">
-                    {(t.success_rate * 100).toFixed(2)}%
-                  </td>
-                  <td className="p-4">
-                    {t.success_rate > 0.99 ? (
-                      <span className="text-green-400">✓ healthy</span>
-                    ) : t.success_rate > 0.95 ? (
-                      <span className="text-yellow-400">⚠ degraded</span>
-                    ) : (
-                      <span className="text-red-400">● outage</span>
-                    )}
-                  </td>
-                </tr>
-              ))
-            )}
+            ))}
           </tbody>
         </table>
       </div>
 
       <div className="mt-8 text-sm text-gray-400">
         Want this on your own tools? <a href="/docs/quickstart">Set up in 60 seconds</a>.
-        Embed a status badge: <a href="/docs/badges">docs/badges</a>.
       </div>
 
       <div className="mt-12 p-6 rounded-lg border border-accent/30 bg-accent/5">
