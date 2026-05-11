@@ -6,8 +6,11 @@ const withMDX = createMDX({
 
 /** @type {import('next').NextConfig} */
 const nextConfig = {
+  output: "export",
   pageExtensions: ["ts", "tsx", "mdx"],
   reactStrictMode: true,
+  trailingSlash: false,
+  images: { unoptimized: true },
   experimental: {
     mdxRs: true,
   },
