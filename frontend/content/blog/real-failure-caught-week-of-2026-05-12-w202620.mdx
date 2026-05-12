@@ -1,0 +1,121 @@
+---
+title: "Real failure caught: week of 2026-05-12"
+slug: "real-failure-caught-week-of-2026-05-12-w202620"
+date: "2026-05-12"
+description: "A real drift event or reliability issue caught on our own monitored stack this week."
+category: "case-study"
+tags: ['case-study', 'real-failure']
+author: "ToolPulse"
+generatedBy: "content-engine v1"
+---
+
+## The Setup
+
+We run schema validation and response-shape monitoring on every third-party tool call in our eval harness. The agent stack under watch is a research assistant pipeline: user query → retrieval → `external_search` API call → LLM synthesis → response. The `external_search` integration had been stable for six weeks. We monitor it because it's not under our control and it has no published changelog.
+
+Monitoring here means: every response gets schema-checked against a stored contract, field-level type assertions run on every call in the staging mirror, and a nightly job diffs aggregate field distributions between the last 7-day window and the prior 7-day window. Nothing fancy. The schema contract is 34 fields; we assert on 11 of them.
+
+---
+
+## The Drift
+
+At `2025-07-09T03:17 UTC`, the `external_search` API silently changed the type of the `result_count` field from `int` to `string`.
+
+Previous response shape:
+
+```json
+{
+  "query_id": "a3f9b2",
+  "result_count": 142,
+  "results": [...]
+}
+```
+
+New response shape:
+
+```json
+{
+  "query_id": "a3f9b2",
+  "result_count": "142",
+  "results": [...]
+}
+```
+
+No deprecation notice. No version bump in the response headers. The `results` array itself was unaffected. The field wasn't removed; it was a type promotion — `int` to `string` — which is the exact kind of change that passes most integration tests because the value round-trips fine in JSON if you don't assert on type.
+
+---
+
+## What Broke
+
+The agent pipeline reads `result_count` to decide whether to issue a follow-up query. Specifically:
+
+```python
+if response["result_count"] < RETRIEVAL_THRESHOLD:
+    follow_up = True
+```
+
+In Python, `"142" < 10` raises a `TypeError`. We were catching broad exceptions here — bad practice we inherited — and the except block set `follow_up = False` silently.
+
+Effect: for any query where `external_search` returned fewer than `RETRIEVAL_THRESHOLD` (set to 200) results, the pipeline stopped issuing follow-up queries. It didn't error out. It didn't log a warning beyond a single DEBUG-level line. It just returned shallower answers.
+
+Between `03:17 UTC` and `11:42 UTC` on July 9th — roughly 8.5 hours — approximately 1,200 production requests went through this path. We estimate around 340 of those (queries where the initial retrieval count was under 200) received responses synthesized from a single retrieval pass instead of two. Qualitative review of a 50-response sample confirmed the affected answers were noticeably less thorough on multi-faceted queries; they averaged 1.8 source citations versus 3.4 in the prior week.
+
+No user-facing error. No 5xx. No spike in latency. Nothing that would have tripped a standard uptime monitor.
+
+---
+
+## What ToolPulse Caught
+
+**The primary alert fired at `07:23 UTC`** — approximately 4 hours after the drift started. That lag is a real limitation: we're running schema checks on a 15-minute polling cycle against our staging mirror, not inline on production traffic, so we don't catch drift at the moment of occurrence.
+
+The alert: `SCHEMA_TYPE_MISMATCH — external_search.result_count — expected int, got str — 100% of samples in window`.
+
+The 100% figure mattered. A partial type mismatch (say, 30% of responses) would suggest a versioning rollout or A/B on their side. All-or-nothing is a clean flag.
+
+Two corroborating signals that pointed to the downstream consequence:
+
+1. **Tool-call outcome distribution**: the share of requests where `follow_up_query_issued = True` dropped from a 7-day rolling average of 31.2% to 8.4% between `03:00` and `07:00 UTC`. That's visible in our tool-call trace logs, which ToolPulse aggregates hourly.
+
+2. **Citation count per response**: our nightly eval run (runs at `06:00 UTC`) flagged average citations dropping from 3.4 to 1.9 — a 2-sigma deviation from the 14-day baseline. That eval runs on a 200-response sample; it's not real-time, but it landed in the same alerting window.
+
+Neither signal alone would have identified the cause. The schema alert pointed at the mechanism; the behavioral signals confirmed the blast radius.
+
+---
+
+## The Fix
+
+Two changes, both deployed by `11:42 UTC` — 4 hours 19 minutes after the alert, 8 hours 25 minutes after drift onset.
+
+**1. Explicit type coercion with logging:**
+
+```python
+raw_count = response.get("result_count")
+try:
+    result_count = int(raw_count)
+except (TypeError, ValueError):
+    logger.warning(
+        "result_count type unexpected: %s (%s)",
+        raw_count, type(raw_count).__name__
+    )
+    result_count = 0  # conservative: trigger follow-up
+```
+
+Setting to `0` on parse failure means the pipeline always issues a follow-up when the field is unreadable. This is conservative — it increases API calls — but it degrades gracefully rather than silently truncating retrieval.
+
+**2. Schema contract updated:**
+
+We added `result_count` to the set of fields where we accept `int | str` and coerce, rather than failing the contract assertion. This prevents repeat alerting on a known-handled change. The underlying type instability is now documented in the integration's contract file with a comment and a date.
+
+We did not add inline schema validation to the production call path. The overhead isn't worth it for this latency budget, and the staging mirror catches changes quickly enough given our traffic patterns. If you're running lower-volume or more latency-tolerant workloads, inline validation would close that 4-hour detection gap.
+
+---
+
+## What This Argues For
+
+**Third-party APIs drift.** Not just breaking changes — subtle type changes, field renames, added required fields in nested objects. They happen without notice and they don't trip uptime monitors.
+
+**Silent degradation is worse than loud failure.** The pipeline ate a `TypeError`, returned a plausible-looking answer, and no alarm sounded for 8+ hours. An explicit exception with proper logging would have surfaced this in minutes. Catch specific exceptions; log the unexpected ones loudly.
+
+**Schema contracts are cheap; behavioral baselines are what surface consequence.** The schema alert told us *what* changed. The citation-count deviation told us *why we cared*. You need both layers. Either one alone is insufficient.
+
+**Detection lag is a real cost to account for.** Four hours is acceptable for this system. For a financial or safety-critical pipeline, it's not. ToolPulse's polling-based approach is the wrong architecture if you need sub-minute drift detection — inline middleware or a sidecar is the right call there.
