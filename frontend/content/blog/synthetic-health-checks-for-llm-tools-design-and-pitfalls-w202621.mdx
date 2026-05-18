@@ -1,0 +1,165 @@
+---
+title: "Synthetic health checks for LLM tools — design and pitfalls"
+slug: "synthetic-health-checks-for-llm-tools-design-and-pitfalls-w202621"
+date: "2026-05-18"
+description: "Technical deep-dive: Synthetic health checks for LLM tools — design and pitfalls"
+category: "deep-dive"
+tags: ['deep-dive', 'engineering']
+author: "ToolPulse"
+generatedBy: "content-engine v1"
+---
+
+Synthetic health checks for LLM tool integrations fail silently more often than they fail loudly. A tool's HTTP endpoint returns 200; your schema validation passes; your agent still produces garbage because the underlying API quietly changed its response semantics three days ago. The fix isn't more unit tests — it's a separate class of check: synthetic transactions that exercise the full tool call path end-to-end, assertions on *meaning* not just structure, and a feedback loop tight enough to catch drift before it compounds through a multi-step chain.
+
+---
+
+## Why structural checks aren't enough
+
+Most teams start with the obvious: ping the endpoint, validate the JSON shape, assert required fields exist. This catches outages. It does not catch:
+
+- A search tool that now returns results ranked by recency instead of relevance (same schema, wrong behavior)
+- A code execution sandbox that silently truncates stdout after 2 KB
+- A calendar API that started returning times in UTC without updating its documentation
+- A retrieval tool whose embedding model was quietly swapped, shifting cosine similarity distributions by ~0.15
+
+Each of these will produce a valid JSON response. Your health check goes green. Your agent's task completion rate drops 8% over two weeks and nobody connects the cause.
+
+Structural checks are necessary but not sufficient. You need checks that encode *what the tool is supposed to do*, not just *what shape it returns*.
+
+---
+
+## Anatomy of a synthetic tool check
+
+A synthetic check for an LLM tool has three parts:
+
+**1. A fixed, deterministic input** — chosen because you know the expected output. Not a random payload; a golden case.
+
+**2. An assertion layer** — which may include semantic assertions, not just structural ones.
+
+**3. A staleness budget** — how often you re-run it, what SLO it needs to meet, and what alert threshold triggers action.
+
+Here's a minimal Python implementation for a search tool wrapper:
+
+```python
+import time
+import httpx
+from dataclasses import dataclass
+from typing import Callable
+
+@dataclass
+class SyntheticCheckResult:
+    passed: bool
+    latency_ms: float
+    failure_reason: str | None = None
+
+def run_synthetic_check(
+    tool_fn: Callable[[dict], dict],
+    input_payload: dict,
+    assertions: list[Callable[[dict], tuple[bool, str]]],
+    timeout_ms: float = 3000,
+) -> SyntheticCheckResult:
+    start = time.monotonic()
+    try:
+        result = tool_fn(input_payload)
+        latency_ms = (time.monotonic() - start) * 1000
+
+        if latency_ms > timeout_ms:
+            return SyntheticCheckResult(
+                passed=False,
+                latency_ms=latency_ms,
+                failure_reason=f"latency {latency_ms:.0f}ms exceeded {timeout_ms}ms budget",
+            )
+
+        for assert_fn in assertions:
+            ok, reason = assert_fn(result)
+            if not ok:
+                return SyntheticCheckResult(
+                    passed=False, latency_ms=latency_ms, failure_reason=reason
+                )
+
+        return SyntheticCheckResult(passed=True, latency_ms=latency_ms)
+
+    except Exception as e:
+        latency_ms = (time.monotonic() - start) * 1000
+        return SyntheticCheckResult(
+            passed=False, latency_ms=latency_ms, failure_reason=str(e)
+        )
+
+
+# Example: search tool check with a semantic assertion
+def check_search_tool(search_fn):
+    known_query = {"q": "Python asyncio event loop", "limit": 5}
+
+    def top_result_is_relevant(response: dict) -> tuple[bool, str]:
+        results = response.get("results", [])
+        if not results:
+            return False, "empty results"
+        top_title = results[0].get("title", "").lower()
+        # Fragile but intentional: if the known golden query stops
+        # returning asyncio content at rank 1, something changed.
+        if "asyncio" not in top_title and "event loop" not in top_title:
+            return False, f"unexpected top result: {top_title!r}"
+        return True, ""
+
+    def result_count_in_range(response: dict) -> tuple[bool, str]:
+        n = len(response.get("results", []))
+        if not (1 <= n <= 5):
+            return False, f"result count {n} out of expected range [1,5]"
+        return True, ""
+
+    return run_synthetic_check(
+        tool_fn=search_fn,
+        input_payload=known_query,
+        assertions=[top_result_is_relevant, result_count_in_range],
+    )
+```
+
+The semantic assertion here is deliberately brittle in one direction: it will false-positive if the search index genuinely changes. That's a feature. You *want* to know when the tool's behavior drifts, even if the change is defensible.
+
+---
+
+## Designing golden cases that don't rot immediately
+
+The hardest part isn't the assertion code — it's choosing inputs whose expected outputs remain stable long enough to be useful. Guidelines that reduce rot:
+
+**Use queries with stable, unambiguous ground truth.** "Capital of France" will return Paris for the foreseeable future. "Best practices for microservices" will drift. For domain-specific tools, pick facts from versioned reference data you control.
+
+**Version your golden cases alongside your tool schema.** When the tool owner bumps a minor version, you re-evaluate affected cases explicitly rather than discovering failures in production.
+
+**Maintain a small set, not a large one.** Fifteen well-chosen golden cases with semantic assertions beat 200 structural checks. More cases mean more maintenance burden and more alert fatigue when the index legitimately changes. A realistic target: 5–10 cases per tool, covering the top two or three semantic capabilities you actually depend on.
+
+**Separate availability checks from behavioral checks.** Run availability checks every 60 seconds. Run behavioral (semantic) checks every 10–15 minutes. Different cadences, different alerting thresholds, different on-call implications.
+
+---
+
+## Where synthetic checks break down
+
+This approach has real limits. Be honest about them:
+
+**High-variance tools.** A creative writing tool, a summarizer with no fixed expected output, or any tool where "correct" is subjective — synthetic checks give you weak signal at best. You can check that the output is non-empty, within a token budget, and doesn't contain obvious failure strings (`"error"`, `"I cannot"`, `"undefined"`), but you can't usefully assert semantic correctness. For these, you need LLM-as-judge evaluation pipelines, not synthetic health checks.
+
+**Tools with side effects.** If your tool sends emails, writes to a database, or charges a payment instrument, you can't run synthetic checks against production. You need a dedicated sandbox environment that mirrors production fidelity. Many teams don't have this. If yours doesn't, synthetic checks on side-effecting tools will either be useless (run against a fake) or dangerous (run against production). Don't pretend otherwise.
+
+**Multi-tool chains.** A synthetic check validates one tool in isolation. It tells you nothing about emergent failures at the boundary between tools — when tool A's output is technically valid but makes tool B's prompt ambiguous. Catching that requires trace-level evaluation against real agent runs, which is a different problem.
+
+**Rapidly-changing APIs.** If a third-party tool releases schema changes weekly, your golden cases will require weekly maintenance. At some threshold of churn, the maintenance cost exceeds the detection value. Know that threshold for your dependencies.
+
+---
+
+## Operational integration: closing the loop
+
+A synthetic check that fires and pages nobody is worse than no check — it trains your team to ignore alerts. Integration requirements:
+
+**Route failures to the right owner.** Tool health failures should page the team that owns the tool integration, not the general on-call. If you can't route at that granularity, you're not ready to run these checks in production.
+
+**Track latency trends, not just pass/fail.** A tool that takes 800 ms today versus 200 ms six weeks ago is degrading even if every check passes. P95 latency over a 30-day window is more informative than a binary green/red. Set a latency SLO per tool (a reasonable starting point: p95 ≤ 500 ms for synchronous tool calls in interactive agents) and alert on sustained breaches.
+
+**Feed results back into agent observability.** When a synthetic check fails and a production agent run fails within the same window, correlate them. This is how you establish causality quickly rather than spending two hours in a postmortem hypothesizing.
+
+**Record check history as a changelog signal.** If you store every check result with a timestamp, you can answer: "When did this tool's behavior last change?" That's invaluable during incident triage.
+
+---
+
+## Where ToolPulse fits
+
+Everything above is implementable from scratch with a cron job, a small assertion library, and your existing observability stack. The overhead is real: writing and maintaining golden cases, routing alerts, storing latency history, correlating check failures with agent traces. ToolPulse handles that operational layer — the scheduling, the alert routing, the latency trend storage, and the trace correlation — so the work you're left with is the part that requires domain knowledge
