@@ -1,0 +1,140 @@
+---
+title: "Real failure caught: week of 2026-05-18"
+slug: "real-failure-caught-week-of-2026-05-18-w202621"
+date: "2026-05-18"
+description: "A real drift event or reliability issue caught on our own monitored stack this week."
+category: "case-study"
+tags: ['case-study', 'real-failure']
+author: "ToolPulse"
+generatedBy: "content-engine v1"
+---
+
+## The Setup
+
+We run continuous schema validation against every tool call our agent stack makes — request payloads out, response payloads in. For the `external_search` integration specifically, we log field names, types, and null rates on every response envelope. Roughly 4,200 search tool calls per day across prod, staging, and eval pipelines. The schema contract is pinned to a snapshot captured at integration time and diffed on a rolling 1-hour window.
+
+This is low-glamour instrumentation. It exists because external APIs change without warning and LLM-based agents fail silently when they do — the model just starts working with garbage and produces confidently wrong output.
+
+---
+
+## The Drift
+
+Tuesday, 2024-01-16, ~14:23 UTC. The `external_search` response envelope changed one field:
+
+```diff
+- "result_count": 142
++ "result_count": "142"
+```
+
+`result_count` promoted from `int` to `string`. No version bump in the API. No changelog entry we've found. The field was present, populated, and non-null — which is why every health check that only tests for field presence passed without complaint.
+
+The full diff ToolPulse logged:
+
+```
+Field: result_count
+  Expected type: integer
+  Observed type: string
+  First seen:    2024-01-16T14:23:11Z
+  Sample count:  11 responses in window
+  Null rate:     0.0 → 0.0 (unchanged)
+  Presence rate: 1.0 → 1.0 (unchanged)
+```
+
+Nothing else changed. The rest of the envelope — `results`, `query_id`, `latency_ms`, `status` — matched the pinned schema exactly.
+
+---
+
+## What Broke
+
+Our research agent uses `result_count` in two places:
+
+1. **Context assembly** — a Python step that compares `result_count` to a threshold integer (`> 50`) to decide whether to paginate and fetch additional result pages.
+2. **A tool-call output parser** — which coerces the result envelope into a typed `SearchResponse` dataclass before handing it to the LLM context window.
+
+The Python comparison `"142" > 50` evaluates to `True` in Python 2 (string/int comparison is defined) but raises `TypeError` in Python 3. We're on Python 3.11. So the context assembly step raised `TypeError` and swallowed it in a bare `except` block that a contractor wrote eight months ago, falling back to `paginate=False`.
+
+The dataclass coercion didn't crash — Pydantic with `model_config = ConfigDict(coerce_numbers_to_str=False)` silently stored the string `"142"` in a field typed `Optional[int]` because the field had no strict validator. The LLM received the string in its context.
+
+Net effect: **agents stopped paginating on any query returning >50 results**, silently. Eval scores on multi-hop research tasks dropped from 0.71 to 0.58 (ROUGE-L against reference answers) over the 26 hours before the fix. We didn't catch it from eval scores alone — the degradation was real but looked like normal variance at first glance. Two users filed tickets about "shallow" answers on Tuesday evening, which we initially attributed to query phrasing.
+
+---
+
+## What ToolPulse Caught
+
+The schema drift alert fired at 14:31 UTC Tuesday — 8 minutes after the first malformed response, once the 11-sample threshold in the 1-hour window was crossed. The alert:
+
+```
+[SCHEMA_DRIFT] external_search / result_count
+Type change: integer → string
+Confidence: HIGH (11/11 samples, 0 rollback observed)
+Affected pipelines: prod-research-agent, eval-harness-nightly
+```
+
+Two correlated signals in the same dashboard window:
+
+- **Pagination rate** on `external_search` calls dropped from 34% to 0% starting at 14:24 UTC. This showed up as a tool-behavior metric, not a schema metric — we track pagination invocations per search call as a ratio.
+- **Pydantic validation warning rate** on `SearchResponse` ticked up from ~0/hr to 6/hr. These were logged at WARNING level but not alerting on their own.
+
+Neither the pagination rate drop nor the Pydantic warnings would have been actionable without the schema diff to explain the cause. The pagination metric alone looks like a shift in query distribution. Together, the three signals had an obvious single explanation.
+
+The user tickets arrived at ~17:00 UTC. The schema alert was already 2.5 hours old by then.
+
+---
+
+## The Fix
+
+Total time from alert to merged fix: **4 hours 17 minutes**.
+
+We did three things:
+
+**1. Hardened the type coercion (30 min)**
+
+```python
+# Before
+class SearchResponse(BaseModel):
+    result_count: Optional[int] = None
+
+# After
+class SearchResponse(BaseModel):
+    result_count: Optional[int] = None
+
+    @field_validator("result_count", mode="before")
+    @classmethod
+    def coerce_result_count(cls, v):
+        if v is None:
+            return v
+        return int(v)  # raises ValueError on non-numeric strings
+```
+
+**2. Removed the bare `except` (45 min, including review)**
+
+```python
+# Before
+except Exception:
+    paginate = False
+
+# After
+except TypeError as e:
+    logger.error("Pagination comparison failed: %s", e)
+    raise
+```
+
+Raising here surfaces the failure rather than silently degrading. We decided the silent fallback was worse than a hard failure that gets paged on.
+
+**3. Added `result_count` type to the pinned schema with tolerance config (20 min)**
+
+We updated the schema pin to accept `int | string` as a tolerated union for this field, with a note that `external_search` appears to have made this permanent. The alert won't fire again for this specific field unless the type changes to something else.
+
+Eval scores recovered to 0.69 by Wednesday morning after the fix deployed — slightly below baseline, likely due to unrelated model variance, not the patch.
+
+---
+
+## What This Argues For
+
+**Type presence is not type correctness.** Every field-presence health check passed throughout this incident. The signal that mattered was the type, not the existence.
+
+**Silent fallbacks are silent degradations.** The bare `except` block was the actual bug. The schema drift made the bug visible, but the design choice to swallow the error meant weeks or months could pass before anyone noticed the quality drop.
+
+**Eval score variance hides short-duration regressions.** A 0.13-point ROUGE-L drop over 26 hours looks like noise in a daily eval run. Structural signals — schema diffs, tool-behavior ratios — have lower latency than quality metrics for this failure mode.
+
+**Where ToolPulse is the wrong choice:** if your external API calls are low-volume (< ~200/day), the sample-threshold approach produces alerts that are either too slow or too noisy. You'd be better served by strict response validation at the call site that raises immediately, with no statistical layer needed.
