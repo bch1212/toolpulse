@@ -1,0 +1,134 @@
+---
+title: "Real failure caught: week of 2026-05-25"
+slug: "real-failure-caught-week-of-2026-05-25-w202622"
+date: "2026-05-25"
+description: "A real drift event or reliability issue caught on our own monitored stack this week."
+category: "case-study"
+tags: ['case-study', 'real-failure']
+author: "ToolPulse"
+generatedBy: "content-engine v1"
+---
+
+## The Setup
+
+We run continuous schema and behavioral monitoring on the tool calls that flow through a multi-agent research pipeline. One of those tools wraps `external_search`, a third-party web search API we call roughly 40,000 times per day across two agent clusters. ToolPulse captures the raw request/response pairs at the tool boundary, computes field-level statistics per 15-minute window, and diffs them against a rolling 7-day baseline. We're not doing anything clever here — it's glorified schema tracking with statistical thresholds on value distributions.
+
+---
+
+## The Drift
+
+On Tuesday at 03:17 UTC, `external_search` silently promoted the `rank` field in search result objects from `int` to `string`.
+
+Before (every response for the prior 90 days):
+
+```json
+{
+  "results": [
+    {
+      "url": "https://example.com",
+      "rank": 1,
+      "score": 0.94
+    }
+  ]
+}
+```
+
+After 03:17 UTC Tuesday:
+
+```json
+{
+  "results": [
+    {
+      "url": "https://example.com",
+      "rank": "1",
+      "score": 0.94
+    }
+  ]
+}
+```
+
+No changelog entry. No deprecation notice in the prior 7 days. The vendor later confirmed this was an unintentional side effect of a serialization library upgrade on their end, and that they consider it "non-breaking" because JSON technically doesn't enforce types.
+
+That last point is worth sitting with. They're not wrong per the JSON spec. They're also not the ones debugging agent behavior at 11 PM.
+
+---
+
+## What Broke
+
+The research pipeline's result-ranking tool parses `rank` with `int(result["rank"])` in one path and direct integer comparison (`result["rank"] < threshold`) in another. Python's `int("1")` works fine. `"1" < 3` raises a `TypeError` in Python 3. So behavior split:
+
+- **Parse path**: worked silently, no error.
+- **Comparison path**: raised unhandled `TypeError`, caught by a broad `except Exception` block that logged a warning and returned an empty result set to the agent.
+
+The agent received empty tool outputs and — because it's a research agent with a fallback behavior — began hallucinating citations rather than retrying. This is a known fragility in the agent design, not a ToolPulse concern. But it's the thing that actually hurt users.
+
+Concretely:
+
+- From 03:17 to 09:44 UTC: **~26,000 tool calls** went through the broken comparison path.
+- Approximately **34% of those** returned empty results to the agent.
+- User-facing citation accuracy (measured by a separate eval pipeline on a 2% sample) dropped from a baseline of 0.81 to **0.57** over that window.
+- No exceptions surfaced in the application error tracker because of the broad catch block.
+
+The error tracker was completely silent. This is exactly the class of failure that monitoring at the tool boundary exists to catch.
+
+---
+
+## What ToolPulse Caught
+
+At 03:31 UTC — 14 minutes after the field promotion — ToolPulse fired a **schema type drift alert**: field `results[*].rank` changed inferred type from `int` to `string` across 100% of responses in the 03:15–03:30 window, versus 0% in the prior 7-day baseline.
+
+Secondary signals that corroborated:
+
+- **Tool output entropy**: the distribution of result-set sizes returned to the agent spiked in the 03:30 window. The 95th-percentile result count dropped from 8 to 0, flagged as a distributional anomaly (KL divergence threshold crossed).
+- **Agent retry rate**: agents calling this tool retried 3.1× more often than baseline in the same window. ToolPulse surfaces this as a derived behavioral metric, not raw logs.
+
+What ToolPulse did *not* catch on its own: it couldn't tell you that empty results caused hallucination. That link required a human looking at the eval pipeline data alongside the alert. The alert told you *something changed at the tool boundary*. The rest was investigation.
+
+The on-call engineer got paged at 03:35 UTC via the PagerDuty integration. She had the ToolPulse diff in front of her within two minutes of acknowledging.
+
+---
+
+## The Fix
+
+Time-to-resolution: **03:35 alert acknowledge → 09:44 deploy** = 6 hours 9 minutes. Slower than it should have been because the fix required a review cycle and we don't have a fast-path deploy for this service.
+
+Two changes shipped:
+
+**1. Defensive parsing at the tool wrapper boundary:**
+
+```python
+# Before
+rank = result["rank"]
+
+# After
+rank = int(result["rank"])  # coerce at ingestion; fail loudly if not castable
+```
+
+**2. Explicit schema validation on ingestion using Pydantic:**
+
+```python
+class SearchResult(BaseModel):
+    url: str
+    rank: int  # coerces str→int automatically; raises ValidationError on failure
+    score: float
+
+    @validator("rank", pre=True)
+    def coerce_rank(cls, v):
+        return int(v)
+```
+
+We chose coercion over rejection because the upstream data is still meaningful — `"1"` and `1` carry the same information here. If the value had been semantically ambiguous, rejection and retry would have been the right call.
+
+We also added a ToolPulse assertion that fires if `rank` type ever deviates from `int` post-ingestion — that is, after our own coercion layer. This catches future drift that our parser handles silently when it shouldn't.
+
+---
+
+## What This Argues For
+
+**Schema contracts between agents and tools are first-class artifacts.** They erode quietly. The vendor did nothing malicious; they just don't share your definition of "breaking change." Monitoring at the tool boundary, separate from application error tracking, is the only way to catch this class of issue when a broad exception handler swallows the signal.
+
+**Behavioral metrics amplify schema signals.** The type change alone told us something changed. The empty result distribution told us it mattered. Both together told us where to look first. Either signal in isolation is slower to act on.
+
+**Six hours is too slow for this.** A fast-path deploy process for tool-wrapper patches would have cut this to under two hours. That's an org problem, not a tooling problem.
+
+**Where ToolPulse isn't the right answer:** if your tool calls number in the hundreds per day rather than tens of thousands, the statistical anomaly detection has low power — you'll get noisy alerts or miss slow drift entirely. At that scale, explicit contract tests run on a schedule are more reliable than distribution monitoring. We document this in the setup guide and it's worth taking seriously before you instrument.
