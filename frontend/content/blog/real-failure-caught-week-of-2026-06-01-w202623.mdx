@@ -1,0 +1,118 @@
+---
+title: "Real failure caught: week of 2026-06-01"
+slug: "real-failure-caught-week-of-2026-06-01-w202623"
+date: "2026-06-01"
+description: "A real drift event or reliability issue caught on our own monitored stack this week."
+category: "case-study"
+tags: ['case-study', 'real-failure']
+author: "ToolPulse"
+generatedBy: "content-engine v1"
+---
+
+## The Setup
+
+Our agent stack runs a research sub-agent that calls an external search API to pull source snippets into a retrieval-augmented generation pipeline. The agent extracts three fields from each result: `rank` (used to weight evidence), `published_date` (used in recency scoring), and `snippet` (fed directly into the context window). We run ToolPulse schema monitors on every tool call response, sampling 100% of payloads in production and storing field-level type histograms at five-minute granularity.
+
+This is a third-party API. We don't control its schema. That's the whole reason the monitor exists.
+
+---
+
+## The Drift
+
+At **14:23 UTC on Tuesday**, the external search API silently promoted `rank` from an integer to a string. No changelog entry appeared until we checked 36 hours later — it was buried in a minor release note under "response format improvements."
+
+Before:
+
+```json
+{
+  "rank": 1,
+  "published_date": "2025-06-10",
+  "snippet": "Researchers found that..."
+}
+```
+
+After:
+
+```json
+{
+  "rank": "1",
+  "published_date": "2025-06-10",
+  "snippet": "Researchers found that..."
+}
+```
+
+A string `"1"` and an integer `1` look identical in a log viewer. They are not the same thing downstream.
+
+---
+
+## What Broke
+
+The rank value feeds a weight calculation:
+
+```python
+score = base_score * (1 / result["rank"])
+```
+
+Python doesn't raise here. `1 / "1"` throws a `TypeError`, which our agent runtime catches and logs as a tool execution warning, then falls back to returning `score = 0.0` for all retrieved results. Every result got equal weight: zero. The retrieval reranker effectively stopped functioning.
+
+From 14:23 UTC onward, the research sub-agent answered every query using unweighted snippets — first retrieved, not best retrieved. Qualitatively, answers became less precise. We don't have a real-time answer-quality metric wired to the monitor (more on that below), but we do track **citation relevance scores** from a lightweight cross-encoder that runs post-generation. That score dropped from a rolling mean of 0.71 to 0.58 over the 40 minutes following the drift event — a 18% degradation.
+
+The fallback to `score = 0.0` also silently swallowed the `TypeError`. No exception surfaced to the error dashboard. This is the failure mode that concerns me more than the schema change itself.
+
+---
+
+## What ToolPulse Caught
+
+ToolPulse fired a **schema drift alert at 14:31 UTC** — eight minutes after the API change. The alert read:
+
+```
+[DRIFT] external_search → field `rank`
+  expected type: integer (p50 obs: 100%, last 6h)
+  observed type: string (p100, window: 14:25–14:30 UTC)
+  confidence: 0.99
+  affected calls: 47/47 in window
+```
+
+The five-minute histogram window meant the first alert lagged the actual change by up to five minutes, plus a two-minute evaluation delay — hence eight minutes total. That's acceptable for this pipeline; it would not be acceptable for a payment flow.
+
+Two corroborating signals were already visible in the dashboard before anyone acted on the alert:
+
+1. **Tool execution warnings** had spiked from a baseline of ~0.3/min to 14/min starting at 14:24 UTC. These were being logged but not alerted on — our threshold was set at 50/min, tuned for a noisier signal. We've since lowered it.
+
+2. **Citation relevance score** had started drifting downward in the same window, but we had no automated alert on it — just a Grafana panel someone checks during morning standup.
+
+The schema alert was the only signal that fired automatically and pointed at the specific field. Without it, we'd have noticed the quality drop at standup the next morning and spent 30-60 minutes correlating tool warnings to a root cause.
+
+---
+
+## The Fix
+
+We updated the result parsing layer to coerce `rank` explicitly and log when coercion is required:
+
+```python
+def parse_rank(raw_rank) -> int:
+    if isinstance(raw_rank, str):
+        logger.warning("rank field received as string; coercing", extra={"raw": raw_rank})
+        return int(raw_rank)
+    return raw_rank
+```
+
+This is a defensive fix, not a correct fix. The correct fix is for the API to stop doing this. We filed a bug with the external_search vendor and got a response that the change was intentional and permanent.
+
+We also added an explicit alert on tool execution warning rate (threshold: 5/min sustained over two consecutive windows) and wired citation relevance score into the alerting stack with a threshold at 0.65.
+
+**Time from alert fire to merged fix:** 2 hours 11 minutes, including review. The latency was mostly humans, not tooling.
+
+---
+
+## What This Argues For
+
+**Explicit type contracts on every third-party tool response.** We had a type hint in the dataclass but no runtime enforcement. A type hint doesn't fail loudly; a coercion function with a warning does.
+
+**Silent fallbacks are dangerous.** The `TypeError` → `score = 0.0` fallback looked like graceful degradation. It was actually graceful quality erosion with no observable signal. If your agent has fallback behavior, make sure the fallback itself is loud.
+
+**Five-minute histogram granularity is a tradeoff.** It's cheap to compute and store. It means you won't catch a drift event and roll back within two minutes. If your SLA requires that, you need a streaming approach — per-call schema validation with an immediate alert path. ToolPulse's histogram model is wrong for latency-sensitive pipelines. It's right for research agents, batch jobs, and anything where an 8-minute detection window is tolerable.
+
+**Secondary quality metrics need alerts, not just dashboards.** The citation relevance score was visible the whole time. Nobody was watching it at 14:23 on a Tuesday. Dashboards are for post-mortems; alerts are for incidents.
+
+The schema change itself was benign — a string that happens to contain a valid integer. The damage came from the combination of no runtime type enforcement, a silent fallback, and an alerting gap on a secondary quality signal. Any one of those alone would have been fine. All three together produced 40 minutes of degraded output before anything automated noticed.
