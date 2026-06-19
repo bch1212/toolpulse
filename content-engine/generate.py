@@ -37,9 +37,11 @@ import httpx
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("content-engine")
 
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
-DATABASE_URL = os.getenv("DATABASE_URL")
-GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-20250514")
+DATABASE_URL = os.getenv("DATABASE_URL", "")
+GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
+
 GITHUB_REPO = os.getenv("GITHUB_REPO", "toolpulse/toolpulse")
 GITHUB_BRANCH = os.getenv("GITHUB_BRANCH", "main")
 CONTENT_DIR = "frontend/content/blog"
@@ -176,11 +178,13 @@ async def draft_with_claude(prompt: str, max_tokens: int = 2200) -> str:
                 "content-type": "application/json",
             },
             json={
-                "model": "claude-sonnet-4-6",
+                "model": ANTHROPIC_MODEL,
                 "max_tokens": max_tokens,
                 "messages": [{"role": "user", "content": prompt}],
             },
         )
+        if r.status_code >= 400:
+            log.error("Claude request failed status=%s body=%s", r.status_code, r.text[:1000])
         r.raise_for_status()
         data = r.json()
         # Concatenate any text blocks
