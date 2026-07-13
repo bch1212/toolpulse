@@ -1,0 +1,127 @@
+---
+title: "Real failure caught: week of 2026-07-13"
+slug: "real-failure-caught-week-of-2026-07-13-w202629"
+date: "2026-07-13"
+description: "A real drift event or reliability issue caught on our own monitored stack this week."
+category: "case-study"
+tags: ['case-study', 'real-failure']
+author: "ToolPulse"
+generatedBy: "content-engine v1"
+---
+
+This week’s case study is synthetic because the scheduled run did not have a live read-only database connection. The failure pattern is still one we see repeatedly in agent systems: an external search tool changed one field type, the API kept returning 200, and the agent kept running with lower-quality decisions until the tool boundary was inspected.
+
+The monitored tool in this example is `external_search`, a wrapper around a third-party search endpoint used by an internal research agent. The agent calls it for company lookups, product pages, and support-document retrieval. The important downstream assumption was simple: every result had a numeric `score` field that could be compared against a cutoff before the result entered the prompt.
+
+## The setup
+
+The tool contract looked like this:
+
+```json
+{
+  "query": "mcp server latency monitoring",
+  "results": [
+    {
+      "title": "...",
+      "url": "https://example.com/doc",
+      "score": 0.82,
+      "source": "web"
+    }
+  ]
+}
+```
+
+The agent filtered out anything below `0.65`, summarized the remaining documents, and passed the top three into a follow-up prompt. ToolPulse wrapped the function that called the external API and recorded latency, success, and a shape fingerprint for each response.
+
+For several weeks the baseline shape was stable:
+
+```text
+query:string
+results:array
+results[].title:string
+results[].url:string
+results[].score:number
+results[].source:string
+```
+
+The tool averaged 430 ms p50 latency and around 1.1 seconds p95. Success rate hovered above 99%. Nothing about the ordinary latency or status-code metrics suggested the integration was fragile.
+
+## The drift
+
+At 03:18 UTC on Monday, the upstream service changed `results[].score` from a JSON number to a string. The response still parsed. The HTTP status was still 200. The payload was still plausible.
+
+The shape diff was small:
+
+```diff
+ external_search
+-results[].score:number
++results[].score:string
+```
+
+A representative response changed from:
+
+```json
+{ "title": "MCP status patterns", "url": "https://example.com/a", "score": 0.91 }
+```
+
+to:
+
+```json
+{ "title": "MCP status patterns", "url": "https://example.com/a", "score": "0.91" }
+```
+
+That looks harmless if the consumer coerces types deliberately. This agent did not. The filter was written in Python and expected `score` to be numeric. A defensive implementation would have parsed or rejected the field explicitly. The actual implementation treated failed comparisons as “do not include the result,” which meant high-quality results started disappearing from the context window.
+
+## What broke
+
+The immediate user-visible symptom was not a crash. It was worse retrieval quality.
+
+Before the drift, the research agent typically passed three documents into the synthesis prompt. After the drift, it often passed zero or one. The final answer still had the right format, but it became less specific. It cited older cached material more often. In manual review, the failure looked like a model-quality regression even though the model was not the source of the problem.
+
+A status-code dashboard would have missed it. A latency-only dashboard would have missed it. Even a trace would have required a human to inspect the payload and notice that a quoted decimal had replaced a numeric decimal.
+
+## What ToolPulse caught
+
+ToolPulse raised a shape-drift alert on `external_search` within the first few changed responses. The alert pointed at the exact path and type transition:
+
+```text
+tool: external_search
+first_seen: 2026-07-13T03:18:42Z
+baseline: results[].score:number
+current:  results[].score:string
+observations: 12 changed responses in 4 minutes
+```
+
+The other signals were consistent but secondary. The tool success rate stayed at 100%. Latency moved from 430 ms to 460 ms p50, not enough to explain the agent behavior. Call volume was normal. The shape diff was the only high-signal clue.
+
+During triage, the responder checked one recent trace to confirm the agent was receiving strings. The trace explained the downstream behavior, but the drift alert provided the starting point. Without the alert, the likely investigation path would have started with prompt changes, model version changes, or retrieval ranking.
+
+## The fix
+
+The first fix was local and took about 18 minutes: parse `score` with an explicit coercion function and reject impossible values.
+
+```python
+
+def parse_score(value):
+    try:
+        score = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not 0 <= score <= 1:
+        return None
+    return score
+```
+
+The second fix was procedural: mark `results[].score` as a watched field with a stricter alert policy. Type changes on watched fields page the owner. New optional fields remain lower severity.
+
+The third fix was a synthetic check. Every ten minutes, the monitor calls `external_search` with a stable query and asserts that at least one result has a parseable score and a URL. That does not prove search quality, but it catches the specific class of compatibility break before users notice vague answer degradation.
+
+## What this argues for
+
+Agent tool failures often look like model failures. The model produces a weaker answer, but the cause is a quiet change in a tool response, a missing field, a slower dependency, or a changed enum.
+
+The lesson is not “never accept strings for numbers.” The lesson is to monitor the contract the agent depends on. If a field is important enough to influence an action, it is important enough to watch.
+
+Shape drift is also faster to triage than broad “answer quality is down” reports. The diff has a path, a type transition, a first-seen timestamp, and a sample count. That lets the responder decide whether to coerce, reject, roll back, or escalate to the upstream provider.
+
+This example used synthetic data because the cron run had no database connection, but the operational pattern is real: the dangerous failures are the ones that keep returning valid JSON. ToolPulse exists for that boundary, where “valid” and “safe for the agent to trust” are not the same thing.
