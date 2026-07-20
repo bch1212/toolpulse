@@ -1,0 +1,122 @@
+---
+title: "ToolPulse vs Langfuse: when to pick which (week of 2026-07-20)"
+slug: "toolpulse-vs-langfuse-when-to-pick-which-week-of-2026-07-20-w202630"
+date: "2026-07-20"
+description: "Honest, side-by-side comparison of ToolPulse and Langfuse for AI agent observability."
+category: "comparison"
+tags: ['langfuse', 'comparison', 'observability']
+author: "ToolPulse"
+generatedBy: "content-engine v1"
+---
+
+Langfuse and ToolPulse both collect telemetry from AI applications, but they start from different failure questions. Langfuse asks what happened across the LLM run. ToolPulse asks whether each tool the agent depended on was healthy and still honored its response contract.
+
+That distinction matters more than the shared word “observability.” If the model chose the wrong tool after a prompt change, start with Langfuse. If the right tool returned valid JSON with a renamed field, start with ToolPulse.
+
+## One-sentence summary of each product
+
+Langfuse is an LLM engineering and observability platform centered on traces, generations, prompts, evaluation scores, datasets, and experiments.
+
+ToolPulse is a tool-call reliability monitor centered on latency, success rate, response-shape fingerprints, drift alerts, and scheduled synthetic checks.
+
+Both can record a tool call. Only one treats the tool’s operational contract as the primary object.
+
+## Where they overlap
+
+Both products help teams move beyond `print()` debugging. They attach metadata to production executions, retain history, and give an engineer somewhere to start when an agent behaves badly.
+
+Both can expose tool latency and failures. A Langfuse span around `lookup_inventory()` can show that the call took 2.8 seconds and raised an exception. ToolPulse records the same duration and failure at the wrapped function boundary. If that is all you need, the products overlap.
+
+Both also require instrumentation discipline. A dashboard cannot explain an uninstrumented path. Teams need consistent names, environment tags, release identifiers, and enough context to connect a telemetry event to deployed code.
+
+The overlap ends when the failure does not look like an exception.
+
+## Where they diverge
+
+### Langfuse follows the run
+
+Langfuse’s useful unit is a trace containing model generations, spans, inputs, outputs, timing, token usage, scores, and related metadata. That view is appropriate when the question is causal:
+
+- Which prompt version ran?
+- What context did retrieval provide?
+- Why did the model call `refund_order` instead of `check_refund_status`?
+- Which generation consumed most of the latency or token budget?
+- Did a new model improve the eval score on a fixed dataset?
+
+Those are application-level questions. Answering them requires the execution tree, not a single tool metric.
+
+ToolPulse does not replace that tree. It does not manage prompt versions, run dataset experiments, or grade model answers. If the tools were healthy and the agent reasoned poorly, ToolPulse has little to say.
+
+### ToolPulse follows the contract
+
+ToolPulse focuses on the boundary where code hands external facts to an agent. It records whether the call succeeded, how long it took, and whether the returned structure resembles the established baseline.
+
+Consider an inventory tool that has always returned:
+
+```json
+{
+  "sku": "A-104",
+  "available": true,
+  "quantity": 12
+}
+```
+
+The provider deploys a compatibility change:
+
+```json
+{
+  "sku": "A-104",
+  "available": "true",
+  "quantity": 12
+}
+```
+
+The request still returns HTTP 200. JSON parsing still succeeds. A trace retains the payload, but an engineer must inspect it or write a specific evaluation to notice the type change. ToolPulse fingerprints the response shape and can report `available: bool -> string` as the event itself.
+
+That is a narrower capability than full tracing. It is also faster to triage when silent contract drift is the incident.
+
+### Synthetic checks are a different operating model
+
+Trace systems observe executions that happen. ToolPulse can also run known probes on a schedule. A check can call `lookup_inventory("HEALTHCHECK-SKU")`, assert a maximum duration, and verify a stable response shape before normal traffic arrives.
+
+This matters for nightly agents and low-volume internal workflows. Passive telemetry cannot report a broken dependency at 03:00 if no run calls it until 09:00. A synthetic check can.
+
+The tradeoff is maintenance. Golden inputs expire, test tenants get deleted, and third-party sandboxes behave differently from production. Synthetic checks are only useful when someone owns them.
+
+### Evals, prompts, and cost belong on the Langfuse side
+
+If the team needs prompt management, experiment tracking, model-output scoring, token accounting, or end-to-end trace inspection, Langfuse covers the larger surface. ToolPulse is intentionally not an LLM quality platform.
+
+That broader surface also means a broader rollout. Framework integrations can reduce setup, but teams still need a trace model, privacy policy, sampling rules, and retention choices. ToolPulse’s smaller target can be easier to add when the immediate problem is a handful of fragile tools.
+
+## 60-second decision guide
+
+**Pick Langfuse if:**
+
+- You need to reconstruct complete agent runs.
+- Prompt versions, model generations, token cost, datasets, or eval scores are first-class concerns.
+- Most incidents begin with “why did the model do that?”
+- You want one LLM application view across retrieval, generations, and tools.
+
+**Pick ToolPulse if:**
+
+- External APIs, MCP servers, or internal service wrappers change without coordinated releases.
+- A valid response with the wrong shape is more dangerous than a clean exception.
+- You need per-tool reliability signals and scheduled probes.
+- Most incidents begin with “can the agent still trust this dependency?”
+
+**Pick neither yet if** the agent is a prototype with no users, no irreversible actions, and one stable tool. Structured logs and strict runtime validation may be enough until the operational cost justifies another system.
+
+## Use both?
+
+Yes, if the system has both reasoning risk and dependency risk. Use Langfuse around the agent run and ToolPulse around the functions exposed as tools.
+
+During an incident, the division is concrete. ToolPulse identifies that `customer_lookup` changed shape at 14:06 UTC. Langfuse shows the 31 traces that consumed the changed response and what each agent did next. One detects the boundary change; the other reconstructs the blast radius.
+
+Avoid duplicate paging. If both systems record latency, choose one owner for latency alerts and keep the other copy for context. Two alerts for the same p95 breach do not provide twice the information.
+
+## What this comparison will not tell you
+
+A feature matrix cannot predict instrumentation overhead, storage cost, privacy fit, self-hosting effort, or how useful either UI will be for your team. Those depend on traffic volume, payload sensitivity, retention, and existing observability practices.
+
+The durable choice is the first question you need answered. Use Langfuse to understand the run. Use ToolPulse to verify the tool contract. If both questions regularly reach production, test both on one real workflow before standardizing.
