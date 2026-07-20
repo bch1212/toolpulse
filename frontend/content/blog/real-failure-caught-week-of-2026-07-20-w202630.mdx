@@ -1,0 +1,161 @@
+---
+title: "Real failure caught: week of 2026-07-20"
+slug: "real-failure-caught-week-of-2026-07-20-w202630"
+date: "2026-07-20"
+description: "A synthetic reconstruction of a common inventory-tool drift failure and how to detect it."
+category: "case-study"
+tags: ['case-study', 'real-failure']
+author: "ToolPulse"
+generatedBy: "content-engine v1"
+---
+
+This week’s scheduled run did not have a working read-only production database connection, so this case study is explicitly synthetic. The timings and counts below illustrate a common failure pattern; they are not ToolPulse production metrics. The pattern is realistic: an inventory endpoint moved its result into a new envelope, returned HTTP 200 throughout, and caused an agent to treat known products as unavailable.
+
+## The setup
+
+In this scenario, a support agent uses `lookup_inventory` before answering delivery questions or proposing substitutes. The tool calls an external commerce API and returns one normalized record:
+
+```json
+{
+  "sku": "A-104",
+  "available": true,
+  "quantity": 18,
+  "warehouse": "DEN-2",
+  "updated_at": "2026-07-20T02:58:11Z"
+}
+```
+
+The agent’s policy is conservative. If `available` is false, it offers a substitute. If the tool fails, it tells the user inventory cannot be confirmed. The fragile path is a successful call with a response the adapter does not recognize.
+
+ToolPulse wraps the function after JSON decoding and before the result enters the agent. The baseline shape is:
+
+```text
+$:object
+$.available:bool
+$.quantity:number
+$.sku:string
+$.updated_at:string
+$.warehouse:string
+```
+
+A synthetic check also queries a reserved SKU every five minutes and expects `sku`, `available`, and `quantity` at the top level.
+
+## The drift
+
+At 03:12 UTC, the provider begins a staged API rollout. Half of requests use a new envelope intended to make room for warnings and pagination metadata:
+
+```json
+{
+  "data": {
+    "sku": "A-104",
+    "available": true,
+    "quantity": 18,
+    "warehouse": "DEN-2",
+    "updated_at": "2026-07-20T03:12:07Z"
+  },
+  "warnings": []
+}
+```
+
+The status code remains 200. Latency changes by less than 20 ms. The provider has not removed any inventory fields; it has moved them under `data`.
+
+The response-shape diff is direct:
+
+```diff
+-$.available:bool
+-$.quantity:number
+-$.sku:string
+-$.updated_at:string
+-$.warehouse:string
++$.data:object
++$.data.available:bool
++$.data.quantity:number
++$.data.sku:string
++$.data.updated_at:string
++$.data.warehouse:string
++$.warnings:array
+```
+
+Because the rollout is partial, old and new shapes coexist. That detail matters. A developer testing one request may see the old response and conclude that nothing changed.
+
+## What broke
+
+The adapter uses `.get()` defaults:
+
+```python
+
+def normalize_inventory(payload: dict) -> dict:
+    return {
+        "sku": payload.get("sku", "unknown"),
+        "available": payload.get("available", False),
+        "quantity": payload.get("quantity", 0),
+        "warehouse": payload.get("warehouse"),
+    }
+```
+
+This code does not throw. For the enveloped response, it returns `available=False` and `quantity=0`. The support agent then gives a confident but wrong answer: the item is unavailable.
+
+In this synthetic timeline, 146 calls arrive between 03:12 and 03:27 UTC. Seventy-one receive the new envelope. Forty-three of those calls lead to substitute recommendations; the rest occur in conversations where inventory is checked but not mentioned.
+
+Ordinary service metrics look healthy:
+
+```text
+HTTP success rate: 100%
+p50 latency:       238 ms -> 246 ms
+p95 latency:       611 ms -> 628 ms
+call volume:       within normal range
+```
+
+An operator looking only at errors and latency has no reason to investigate. A model-quality reviewer may blame the prompt because the visible symptom is a bad answer.
+
+## What ToolPulse would catch
+
+The first changed response creates a new shape fingerprint. The monitor records it as an observation rather than paging immediately because one new variant may be a rare valid case.
+
+After five changed responses in the rolling window, the new shape exceeds the drift threshold. The alert contains the affected tool, exact path changes, first-seen timestamp, and frequency:
+
+```text
+tool: lookup_inventory
+first_seen: 2026-07-20T03:12:07Z
+baseline_shape: 98.7% of prior 7-day calls
+new_shape: 48.9% of current 10-minute window
+status: success
+latency_delta: +3.4%
+```
+
+The scheduled probe fails at 03:15 because the required top-level fields are absent. That second signal changes the alert from “new response variant” to “known contract assertion failed.” The combination is stronger than either signal alone.
+
+A trace remains useful after detection. It shows that the agent received the adapter’s default `available=False` and followed policy correctly. The model did not invent the stock status. The adapter converted structural drift into false data.
+
+## The fix
+
+The immediate patch accepts both envelopes and rejects responses that contain neither form:
+
+```python
+
+def normalize_inventory(payload: dict) -> dict:
+    record = payload.get("data", payload)
+    required = {"sku", "available", "quantity"}
+    missing = required - record.keys()
+    if missing:
+        raise ValueError(f"inventory response missing: {sorted(missing)}")
+
+    return {
+        "sku": str(record["sku"]),
+        "available": bool(record["available"]),
+        "quantity": int(record["quantity"]),
+        "warehouse": record.get("warehouse"),
+    }
+```
+
+The safer long-term change is to stop using business-significant defaults for missing fields. `False` is a valid inventory fact, not an error sentinel. Missing `available` should fail closed as “unknown,” not silently become “unavailable.”
+
+The team also keeps two synthetic checks during the provider migration: one verifies the old top-level variant and one verifies the new envelope. Once the rollout is complete and the old contract is retired, the old fingerprint moves out of the accepted baseline.
+
+## What this argues for
+
+An agent can behave exactly as designed and still produce a wrong action when its tool adapter converts malformed structure into valid-looking values. That failure sits below prompt evaluation and above HTTP uptime.
+
+Monitor the raw tool response before normalization. Validate required fields without semantic defaults. Track shape frequency so partial rollouts are visible. Use a synthetic probe for fields that authorize an action.
+
+This scenario is synthetic because the production metrics connection was unavailable during generation. The engineering lesson does not depend on invented evidence: HTTP success is not contract success, and a missing boolean must never be allowed to become a business decision by default.
