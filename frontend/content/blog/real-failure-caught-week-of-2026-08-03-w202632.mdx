@@ -1,0 +1,112 @@
+---
+title: "Real failure caught: week of 2026-08-03"
+slug: "real-failure-caught-week-of-2026-08-03-w202632"
+date: "2026-08-03"
+description: "A reconstructed tool-contract drift case study, clearly labeled where live production data was unavailable."
+category: "case-study"
+tags: ['case-study', 'real-failure']
+author: "ToolPulse"
+generatedBy: "content-engine v1"
+---
+
+This case study is a reconstructed incident based on a common production failure pattern. No live ToolPulse drift event was available to the content run this week, so the service name and timestamps below are illustrative rather than claims about a specific customer or vendor.
+
+## The setup
+
+An agent used a tool named `external_search` to find support articles and rank them before drafting an answer. The tool returned a JSON object with a `results` array. Each result included an identifier, title, URL, and numeric relevance score.
+
+The application depended on the score for two decisions: discard results below `0.65`, then sort the remainder from highest to lowest. A typical response looked like this:
+
+```json
+{
+  "results": [
+    {
+      "id": "kb_1842",
+      "title": "Resetting a workspace token",
+      "url": "https://example.invalid/kb/1842",
+      "score": 0.91
+    }
+  ]
+}
+```
+
+ToolPulse wrapped the call and recorded success, latency, and a shape fingerprint. A synthetic check exercised the same query every five minutes because support traffic was low overnight. The operational thresholds were 1.5 seconds for p95 latency and zero unacknowledged shape changes on the synthetic probe.
+
+## The drift
+
+At 02:17 UTC, the provider deployed a response-normalization change. The endpoint still returned HTTP 200 in 240–310 ms, but `score` changed from a JSON number to a formatted string:
+
+```diff
+ {
+   "results": [
+     {
+       "id": "kb_1842",
+       "title": "Resetting a workspace token",
+       "url": "https://example.invalid/kb/1842",
+-      "score": 0.91
++      "score": "91%"
+     }
+   ]
+ }
+```
+
+The new value was understandable to a person and valid JSON. It was not compatible with the consumer’s contract. The shape fingerprint moved from `results[].score:number` to `results[].score:string`.
+
+No availability monitor would have caught the problem. DNS resolved, TLS succeeded, the status code was 200, and the response time was better than the previous hour’s median.
+
+## What broke
+
+The ranking function compared each score with the floating-point threshold `0.65`. In the strict path, the comparison raised a type error. A broad exception handler then returned the provider’s original order rather than failing the entire request.
+
+That fallback kept the agent online but reduced answer quality. Low-relevance articles appeared before the correct token-reset article. The agent cited an older authentication guide in two of the first seven reconstructed requests. End-to-end latency increased from 2.1 seconds to 3.4 seconds because the agent made a second search with a broader query after receiving weak context.
+
+This is the dangerous middle state: the system is not down, but its output is less reliable. Error-rate monitoring saw successful requests. Latency monitoring saw a modest increase in the full agent run, not in the tool itself. The final text remained grammatical.
+
+## What ToolPulse caught
+
+The 02:20 UTC synthetic check produced a new shape hash and a field-level diff identifying `results[].score` as the changed path. The alert contained three useful facts:
+
+- The tool call succeeded at the transport layer.
+- Latency remained within its normal range.
+- The response contract changed from number to string.
+
+That combination narrowed the investigation. Engineers did not begin with the model prompt, vector index, or network. They replayed the captured response against the parser and reproduced the ranking failure immediately.
+
+The team acknowledged the alert at 02:24. By 02:27, a production trace showed the fallback branch and extra search call. The shape signal identified the cause; the trace showed the user impact. Neither signal alone told the complete story.
+
+## The fix
+
+The immediate mitigation normalized percentages at the adapter boundary and rejected unknown score formats:
+
+```python
+from typing import Any
+
+
+def normalize_score(value: Any) -> float:
+    if isinstance(value, (int, float)):
+        score = float(value)
+    elif isinstance(value, str) and value.endswith("%"):
+        score = float(value[:-1]) / 100.0
+    else:
+        raise ValueError(f"unsupported score format: {type(value).__name__}")
+
+    if not 0.0 <= score <= 1.0:
+        raise ValueError("score outside [0, 1]")
+    return score
+```
+
+The adapter deployed at 02:38 UTC. A synthetic replay passed at 02:40, for a reconstructed time to resolution of 20 minutes from the first alert. The team then removed the broad ranking fallback. Future parse failures would return a controlled partial response and emit an explicit `contract_error` rather than silently using unranked results.
+
+The longer-term change was a consumer-owned contract test. A stored fixture asserted that every `results[].score` could be normalized to a value from zero through one. The test ran in CI and against the provider’s sandbox each morning. The provider adapter, not the agent prompt, became responsible for translating external formats into the application’s internal schema.
+
+## What this argues for
+
+First, availability is not compatibility. Status codes and latency cannot prove that an agent received data it can safely use.
+
+Second, shape alerts should be diagnostic, not merely hashes. “Response changed” creates work. “`results[].score` changed from number to string” points to the parser and shortens the incident.
+
+Third, fallbacks need quality telemetry. Returning an unranked list avoided an exception but concealed degradation. A fallback should increment a named metric and preserve enough context to estimate impact.
+
+Fourth, retries would not have helped. The provider consistently returned the new schema. Three retries would have produced the same incompatible value while adding latency and cost.
+
+Finally, synthetic checks matter most when traffic is sparse. Without the five-minute probe, the first morning support request would have been the detector. Monitoring the tool boundary turned a silent quality regression into a bounded adapter change before normal traffic resumed.
