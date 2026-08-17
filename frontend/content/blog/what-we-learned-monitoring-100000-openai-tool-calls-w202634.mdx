@@ -1,0 +1,111 @@
+---
+title: "What we learned monitoring 100,000 OpenAI tool calls"
+slug: "what-we-learned-monitoring-100000-openai-tool-calls-w202634"
+date: "2026-08-17"
+description: "Technical deep-dive: What we learned monitoring 100,000 OpenAI tool calls"
+category: "deep-dive"
+tags: ['deep-dive', 'engineering']
+author: "ToolPulse"
+generatedBy: "content-engine v1"
+---
+
+A six-figure call count does not make an observability design rigorous. It only makes weak assumptions expensive. The useful exercise is to model 100,000 tool calls, state exactly what is measured, and keep claims separate from production evidence.
+
+This article uses a 100,000-call replay as a sizing and instrumentation exercise. It is not a claim that ToolPulse processed 100,000 fresh production calls this week. That distinction belongs in the first paragraph, not a footnote.
+
+## Start with the event, not the dashboard
+
+For each OpenAI tool call, the minimum useful event has five parts:
+
+1. A stable tool name and version.
+2. Start and end timestamps from the same monotonic clock.
+3. Success, failure class, and retry count.
+4. A response-shape fingerprint.
+5. A correlation identifier that links the tool call to its parent request or trace.
+
+Arguments and full responses are optional, not default. They increase privacy risk, storage cost, and cardinality. Most reliability questions do not require them.
+
+A compact event near 1 KiB produces about 97.7 MiB of raw event data across 100,000 calls before indexes, replication, or compression. That is manageable. Unbounded payload capture is not. A single 50 KiB response field changes the storage problem by roughly two orders of magnitude.
+
+## Percentiles need population context
+
+A p99 chart without a call count is easy to misread. One minute may contain ten calls and the next may contain ten thousand. The percentile can move because the workload changed, not because the tool changed.
+
+Record at least the count, p50, p95, p99, timeout rate, and error rate per tool and version. Keep the aggregation window visible. For low-volume tools, show individual observations or wider windows rather than a smooth line that implies confidence the data does not support.
+
+Do not average percentiles across shards. Merge histograms or sketches that preserve the underlying distribution. An average of regional p99 values is not the global p99.
+
+Retries also need explicit treatment. If a logical operation makes three attempts, report both attempt latency and end-to-end latency. Otherwise retries can make the tool dashboard look healthy while users wait through multiple timeouts.
+
+## Instrumentation overhead is a budget
+
+Suppose synchronous instrumentation adds 2 ms to every call. Across 100,000 calls that is 200 seconds of aggregate latency, even though those seconds are distributed across concurrent requests. The per-request number sounds small; the fleet cost and tail effects may not be.
+
+Keep the hot path bounded:
+
+```python
+import time
+
+async def monitored_call(tool, payload, emit):
+    started = time.perf_counter_ns()
+    ok = False
+    try:
+        result = await tool(payload)
+        ok = True
+        return result
+    finally:
+        elapsed_ms = (time.perf_counter_ns() - started) / 1_000_000
+        emit.enqueue_nowait({
+            "tool": tool.__name__,
+            "ok": ok,
+            "latency_ms": elapsed_ms,
+        })
+```
+
+The queue must have a limit. When it is full, choose and measure a failure policy: drop events, sample, or briefly backpressure. Do not let an observability outage become an application outage. Also emit a counter for dropped telemetry; silent loss makes every downstream rate suspect.
+
+## Shape fingerprints catch a different class of failure
+
+HTTP status and exception rate are necessary but incomplete. A tool can return `200 OK` while changing a field from an integer to a string, removing a nested object, or replacing a list with `null`. The transport succeeded; the agent contract did not.
+
+A shape fingerprint should ignore values and retain structural facts such as field paths, container types, and selected optionality. It should be stable under harmless value changes and sensitive to changes that can alter agent behavior.
+
+Version the fingerprint algorithm. If the algorithm changes without a version marker, the monitoring system can manufacture drift across every tool at once.
+
+Not every added field deserves an alert. Classify changes:
+
+- Removed required field: high severity.
+- Type change on a consumed field: high severity.
+- New optional field: usually informational.
+- Array element shape change: severity depends on the parser.
+- Value-distribution change with stable shape: a separate semantic signal.
+
+## Sampling depends on the question
+
+A one-percent sample of 100,000 calls contains 1,000 events. That can estimate common latency behavior, but it is poor protection against rare failures. A 0.1-percent failure rate represents 100 failures in the full population; uniform sampling may retain too few examples for diagnosis.
+
+Use different policies for different data:
+
+- Keep counters and compact histograms for every call.
+- Keep every error event, subject to a safety cap.
+- Keep every new shape fingerprint until it is classified.
+- Sample repetitive successful exemplars.
+- Increase sampling around a deployment or detected anomaly.
+
+Sampling decisions must happen after the system has preserved the aggregates needed for rates. Sampling first and then treating retained rows as the full denominator produces attractive, wrong dashboards.
+
+## Cardinality is the quiet failure mode
+
+Tool name, version, environment, and bounded error class are reasonable dimensions. User identifiers, raw URLs, exception text, request IDs, and arbitrary argument values are not reasonable metric labels.
+
+High-cardinality values belong in events or traces, where retention and indexing can be controlled. A single customer ID added as a metric label can turn a predictable time series into millions of series.
+
+Build a cardinality test into CI. Feed representative metadata into the label-normalization code and fail if an unbounded key reaches the metrics path.
+
+## Where this advice does not apply
+
+A small internal agent with a few hundred calls per week may not need fingerprints, histograms, or adaptive sampling. Structured logs plus contract tests can be cheaper and clearer.
+
+The guidance also does not replace evaluations. Shape stability cannot tell you whether a search result became less relevant or whether the model selected the wrong tool. Reliability telemetry and behavioral evaluation answer different questions.
+
+The practical lesson from the 100,000-call exercise is not “collect more.” It is “define less, precisely.” Record a bounded event, preserve population-level aggregates, retain rare failures, and make telemetry loss visible. ToolPulse focuses on that tool boundary; a broader tracing system should apply the same discipline elsewhere.
