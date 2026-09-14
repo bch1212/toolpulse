@@ -1,0 +1,133 @@
+---
+title: "Real failure caught: week of 2026-09-14"
+slug: "real-failure-caught-week-of-2026-09-14-w202638"
+date: "2026-09-14"
+description: "A reconstructed pagination-contract drift case study, clearly labeled where live production data was unavailable."
+category: "case-study"
+tags: ['case-study', 'real-failure']
+author: "ToolPulse"
+generatedBy: "content-engine v1"
+---
+
+This is a reconstructed incident, not a claim about a ToolPulse customer or a specific provider. The production database was queried for the seven-day window ending September 14, 2026 and contained no drift events or tool calls. The service name, traffic, timestamps, and impact below are illustrative; the contract failure pattern is representative of incidents that shape monitoring is designed to detect.
+
+## The setup
+
+An agent used `external_catalog` to find replacement parts from a third-party catalog. The tool fetched up to five pages, normalized each result, and returned the best matches to the model. Most queries fit on one page, so pagination received less exercise than parsing the item records.
+
+The provider’s response contract exposed a nullable top-level cursor:
+
+```json
+{
+  "items": [
+    {"sku": "P-1842", "name": "Valve assembly", "in_stock": true}
+  ],
+  "next_cursor": "eyJwYWdlIjoyfQ=="
+}
+```
+
+The adapter stopped when `next_cursor` was `null`. ToolPulse wrapped the provider call, recorded latency and success, and fingerprinted the response shape. A synthetic check ran every ten minutes, but its default query returned only four items and never produced a second page.
+
+The agent’s quality target required at least ten candidates before reranking. For broad searches, the adapter usually fetched three pages and returned 25 to 40 candidates.
+
+## The drift
+
+At the illustrative time 03:12 UTC, the provider moved pagination metadata into a nested object:
+
+```diff
+ {
+   "items": [
+     {"sku": "P-1842", "name": "Valve assembly", "in_stock": true}
+   ],
+-  "next_cursor": "eyJwYWdlIjoyfQ=="
++  "pagination": {
++    "next": "eyJwYWdlIjoyfQ=="
++  }
+ }
+```
+
+The endpoint still returned HTTP 200. Item parsing still succeeded. Median provider latency stayed near 280 ms. The Python adapter used `payload.get("next_cursor")`, so the missing key produced `None` and looked exactly like the final page.
+
+The call did not throw an exception. From a transport perspective, it was healthy. From the consumer’s perspective, a required continuation field had disappeared.
+
+The response fingerprint changed from:
+
+```text
+items:[{in_stock:boolean,name:string,sku:string}],next_cursor:string
+```
+
+to:
+
+```text
+items:[{in_stock:boolean,name:string,sku:string}],pagination:{next:string}
+```
+
+## What broke
+
+Broad catalog searches silently stopped after page one. The average candidate set fell from 31 items to 9. The agent still produced an answer, but it often missed the correct regional variant because those records ranked onto later pages at the provider.
+
+In the reconstructed exposure window, 18 sessions used a multi-page query. Five returned a lower-confidence recommendation, and two asked the user for details that were already represented in omitted catalog records. No requests failed, and tool latency improved because the adapter made fewer network calls.
+
+That last point matters. A conventional dashboard looked healthier:
+
+- HTTP success remained 100%.
+- Tool exceptions remained at zero.
+- Average end-to-end tool latency dropped from 940 ms to 315 ms.
+- Token usage fell because the model received fewer candidates.
+
+All four signals moved in a direction that could be mistaken for an optimization. Output quality moved the other way.
+
+## What ToolPulse caught
+
+The first broad production query after the provider change returned the new fingerprint at 03:18 UTC. The alert identified one removed path, `next_cursor`, and one added object, `pagination.next`.
+
+The alert did not claim that the new schema was invalid. Added fields are often harmless, and providers are allowed to evolve their APIs. The high-severity signal was the removal of a previously observed field that the adapter consumed.
+
+Responders compared three facts:
+
+1. The tool call succeeded.
+2. Latency dropped sharply.
+3. The response contract changed at the same time.
+
+That combination redirected the investigation away from model selection and ranking prompts. At 03:24, a replay showed that the pagination loop exited after one iteration. The captured structural diff narrowed the review to the adapter boundary without requiring full customer payloads in the alert.
+
+The original synthetic check did not catch the drift because its query never paginated. This was also useful evidence: the monitor worked, but the probe did not cover the risky branch.
+
+## The fix
+
+The immediate adapter patch accepted both contracts and failed explicitly when pagination state was ambiguous:
+
+```python
+from typing import Any
+
+
+def next_cursor(payload: dict[str, Any]) -> str | None:
+    if "next_cursor" in payload:
+        value = payload["next_cursor"]
+    elif isinstance(payload.get("pagination"), dict):
+        value = payload["pagination"].get("next")
+    else:
+        raise ValueError("catalog response has no pagination contract")
+
+    if value is not None and not isinstance(value, str):
+        raise TypeError("pagination cursor must be a string or null")
+    return value
+```
+
+The patch deployed at the illustrative time 03:37 UTC. A replay fetched three pages and returned 34 candidates at 03:40, making the reconstructed time to resolution 22 minutes from the first alert.
+
+The team then changed the synthetic query to guarantee at least two pages. The check asserted both that a continuation cursor existed on page one and that following it produced a different result set. A single-page “status 200” probe had tested availability but not the contract branch the application depended on.
+
+A second change emitted `pages_fetched` and `candidate_count` as bounded tool metrics. A sudden drop from three pages to one would then create a semantic signal even if a future provider change preserved the same JSON types.
+
+## What this argues for
+
+First, lower latency is not always better. If work disappears from an execution path, duration and cost can improve while correctness degrades. Operational review needs expected-work signals such as pages fetched, rows read, or candidates returned.
+
+Second, permissive accessors can hide contract failures. `dict.get()` is appropriate for optional data; it is dangerous when absence means “stop processing.” Required control-flow fields deserve explicit validation.
+
+Third, shape monitoring should distinguish removed consumed fields from added optional fields. Both change a hash, but they do not have the same risk.
+
+Fourth, synthetic checks must force important branches. A health query that never paginates cannot validate pagination. The same rule applies to authentication refresh, empty-result handling, rate limits, and partial failures.
+
+Finally, contract telemetry and behavioral evaluation remain complementary. The shape diff explains why the adapter changed behavior. Candidate-count and session-quality measurements show whether users were affected. ToolPulse focuses on the boundary signal; the application still needs tests and evaluations for meaning beyond structure.
