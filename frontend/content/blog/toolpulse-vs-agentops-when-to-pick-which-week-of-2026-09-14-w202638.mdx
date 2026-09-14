@@ -1,0 +1,144 @@
+---
+title: "ToolPulse vs AgentOps: when to pick which (week of 2026-09-14)"
+slug: "toolpulse-vs-agentops-when-to-pick-which-week-of-2026-09-14-w202638"
+date: "2026-09-14"
+description: "Honest, side-by-side comparison of ToolPulse and AgentOps for AI agent observability."
+category: "comparison"
+tags: ['agentops', 'comparison', 'observability']
+author: "ToolPulse"
+generatedBy: "content-engine v1"
+---
+
+ToolPulse measures whether individual agent tools are healthy and returning structurally compatible data. AgentOps is designed around observing agent sessions so teams can inspect how a run unfolded. Both help debug agents, but they start from different operational questions.
+
+## Where they overlap
+
+Both products belong in an AI-agent observability stack. Both reduce the need to build custom telemetry around every agent. Both can help connect a bad result to the calls that preceded it.
+
+ToolPulse treats `search_web`, `lookup_customer`, or `create_invoice` as a service boundary with its own latency, error rate, response shape, and synthetic-check history. AgentOps treats the full run as the object to inspect: the sequence of model calls, tool invocations, and outcomes that produced a result.
+
+## Where they diverge
+
+### Unit of observation
+
+ToolPulse aggregates by tool. It is intended to answer questions such as:
+
+- Did `external_search` become slower after a provider deployment?
+- Did a successful response lose a required field?
+- Is the tool failing when normal agent traffic is absent?
+- Did one tool account for most failed calls during an incident?
+
+AgentOps is a better conceptual fit for questions about the complete execution:
+
+- Why did this run choose the wrong tool?
+- Which step caused the session to miss its goal?
+- What happened before the agent entered a retry loop?
+- Which runs need replay or human review?
+
+Those are adjacent questions, not interchangeable ones.
+
+### Instrumentation boundary
+
+ToolPulse wraps the function that implements a tool:
+
+```python
+from toolpulse import monitor
+
+@monitor
+def lookup_customer(customer_id: str) -> dict:
+    return crm.get_customer(customer_id)
+```
+
+```typescript
+import { monitor } from "toolpulse";
+
+const lookupCustomer = monitor(async (customerId: string) => {
+  return crm.getCustomer(customerId);
+});
+```
+
+That boundary is intentionally narrow. Basic telemetry includes duration, success or failure, and the structural fingerprint of the returned value. The application does not need to route model traffic through a proxy or make ToolPulse responsible for the rest of the session.
+
+A session-oriented platform requires instrumentation at the agent-run level. That broader scope is useful when the sequence matters. It also means the data model and debugging workflow center on sessions rather than independent tool service levels.
+
+### Contract drift
+
+ToolPulse fingerprints response shape. Consider a tool that normally returns:
+
+```json
+{"results": [{"id": "a1", "score": 0.92}]}
+```
+
+If the provider changes `score` from a number to a string, the HTTP request can still return 200 and the agent framework can still mark the call successful. A shape-aware monitor can flag `results[].score:number -> string` at the boundary.
+
+A session trace can preserve the changed response and show the downstream effect, which is valuable for diagnosis. It does not make boundary-level contract classification redundant. One signal identifies that the data contract changed; the other shows what the agent did after receiving it.
+
+### Synthetic checks
+
+ToolPulse can exercise tools on a schedule. That matters for low-traffic tools and overnight dependencies. A five-minute probe can detect a provider failure before the next production session reaches the code path.
+
+Session observability is strongest when sessions exist. If the operational requirement is “tell us whether the billing lookup works before the 06:00 batch starts,” a synthetic tool check is the direct mechanism.
+
+### Reasoning and run reconstruction
+
+ToolPulse does not attempt to explain why a model selected a tool or interpreted a correct response incorrectly. It does not replace session replay, prompt traces, evaluations, or goal-level scoring.
+
+That is where AgentOps is the more natural choice. If every tool is healthy but the agent chooses `cancel_order` instead of `check_order_status`, per-tool latency and shape history will not explain the decision path. A session view can.
+
+### Alert ownership
+
+Tool-scoped alerts can route to the owner of a dependency adapter: error-rate threshold exceeded, p95 latency breached, or response shape changed. Session-scoped failures often route to the team that owns agent behavior, prompts, or workflow orchestration.
+
+Keeping those ownership boundaries explicit prevents a common incident-response failure: asking the model team to investigate a provider contract change, or asking the API integration team to explain an incorrect planning decision.
+
+## 60-second decision guide
+
+**Pick ToolPulse if:**
+
+- Third-party APIs, MCP servers, databases, or internal services are the unreliable part of the stack.
+- A field rename or type change can silently degrade agent output.
+- You want each tool to have an independent latency and success history.
+- You need scheduled probes when normal traffic is sparse.
+- Your operating model is “treat tools like production dependencies with contracts and service levels.”
+
+**Pick AgentOps if:**
+
+- You primarily need to reconstruct individual agent sessions.
+- The difficult failures involve tool selection, planning, retries, or goal completion.
+- QA or safety review requires a run-level history.
+- Tools are stable, but agent behavior is not.
+- Session replay is more useful to your team than a per-tool reliability dashboard.
+
+**ToolPulse is the wrong choice if:**
+
+- The application makes no tool calls.
+- The main problem is prompt quality or model behavior.
+- You need one trace that explains every decision in a run.
+- Contract drift and synthetic availability checks are not meaningful risks for your system.
+
+**AgentOps is not sufficient by itself if:**
+
+- You must detect tool degradation before a user session runs.
+- Successful HTTP responses can carry incompatible data.
+- On-call responders need dependency-level alerting and aggregation.
+
+## Use both?
+
+Yes. The instrumentation can be complementary.
+
+ToolPulse can report that `price_lookup` changed shape at 09:12 and that its p95 latency stayed flat. AgentOps can identify the sessions that consumed the changed payload and show whether the agent retried, produced a partial answer, or took an unsafe action.
+
+A practical incident workflow is:
+
+1. A tool-level alert identifies the affected dependency and contract path.
+2. The adapter owner patches or rolls back the integration.
+3. Session search finds runs made during the exposure window.
+4. The agent team reviews those runs for user impact.
+
+Using both adds telemetry cost and another correlation problem. Include a shared request or trace identifier so a tool event can be linked to its parent session. Without that link, two observability products can create two isolated accounts of the same incident.
+
+## What this comparison will not tell you
+
+This is an architecture and use-case comparison, not a benchmark. It does not establish current price, retention limits, hosted-service performance, or feature availability for a particular plan. Verify those details against each vendor before buying.
+
+It also cannot identify your dominant failure mode. Review a representative set of incidents. If most begin with malformed or unavailable dependencies, instrument the tool boundary first. If most begin with planning or reasoning errors despite healthy dependencies, prioritize session observability. Product category matters less than measuring the layer that actually fails.
