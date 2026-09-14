@@ -1,0 +1,139 @@
+---
+title: "Three patterns for alert dedup that don't lose signal"
+slug: "three-patterns-for-alert-dedup-that-dont-lose-signal-w202638"
+date: "2026-09-14"
+description: "Technical deep-dive: Three patterns for alert dedup that don't lose signal"
+category: "deep-dive"
+tags: ['deep-dive', 'engineering']
+author: "ToolPulse"
+generatedBy: "content-engine v1"
+---
+
+Alert deduplication should reduce notifications, not observations. The safe design keeps every event available for counting and diagnosis, then applies stateful grouping only at the notification boundary. If deduplication deletes evidence or turns distinct failures into one permanent incident, it has traded pager noise for blindness.
+
+## Pattern 1: deduplicate on a bounded incident key
+
+A useful incident key describes the operational cause closely enough to group repeats, but not so broadly that unrelated failures collapse together.
+
+For tool-call monitoring, a reasonable key might include:
+
+- environment
+- tool name
+- failure class
+- response-shape fingerprint or changed field path
+- deployment or provider version, when available
+
+Do not key on raw exception text. Request IDs, timestamps, user identifiers, and payload fragments make every event unique. At the other extreme, a key such as `production:search:error` can merge timeouts, authentication failures, and contract drift into one alert.
+
+Normalize the dimensions before hashing them. Map noisy errors to a bounded taxonomy such as `timeout`, `rate_limit`, `auth`, `transport_5xx`, and `contract_change`. Keep the original error in the event record, not in the metric label or incident key.
+
+```python
+from dataclasses import dataclass
+from hashlib import sha256
+
+@dataclass(frozen=True)
+class Signal:
+    environment: str
+    tool: str
+    failure_class: str
+    contract_path: str | None = None
+
+
+def incident_key(signal: Signal) -> str:
+    parts = (
+        signal.environment.strip().lower(),
+        signal.tool.strip().lower(),
+        signal.failure_class.strip().lower(),
+        (signal.contract_path or "none").strip().lower(),
+    )
+    canonical = "|".join(parts)
+    return sha256(canonical.encode()).hexdigest()[:20]
+```
+
+The truncated hash is for indexing, not security. Store the canonical dimensions next to it so responders can understand why events grouped together.
+
+Set a bounded grouping window. If 800 identical timeout events arrive in ten minutes, one incident with a count of 800 is useful. If the same timeout returns three days after the incident was resolved, it should open a new incident rather than silently attach to history.
+
+A common starting point is a 15-minute active window plus a two-minute quiet period before resolution. Those numbers are policy, not universal constants. A checkout tool may need a 60-second window; a daily data import may need an hour.
+
+## Pattern 2: use a state machine with escalation checkpoints
+
+A boolean `alerted=true` flag is not enough. It suppresses repeats but cannot express worsening severity, recovery, or recurrence.
+
+Model the notification state explicitly:
+
+- `new`: the first qualifying event arrived
+- `active`: more matching events are accumulating
+- `escalated`: rate, duration, or impact crossed another threshold
+- `recovering`: healthy observations have resumed
+- `resolved`: the quiet or healthy window completed
+- `reopened`: the same incident key failed again after resolution
+
+Every event updates counters and timestamps. Only selected transitions send notifications.
+
+Suppose `external_search` normally makes 20 calls per minute. A policy could notify on the first five failures in two minutes, escalate at 25 failures or ten affected sessions, and resolve after three consecutive healthy probes. During a 12-minute provider outage with 240 failed calls, the pager receives three messages: opened, escalated, and resolved. The event store still contains all 240 failures.
+
+This preserves changes in severity. A naïve 30-minute suppression timer would hide the difference between five failures that stop and five failures that become 5,000.
+
+Escalation should evaluate more than raw count. Useful checkpoints include:
+
+- failure rate, with a minimum denominator
+- number of affected accounts or sessions
+- duration since the first failure
+- transition from partial degradation to total failure
+- appearance of a second failure class on the same tool
+- synthetic-check failure while production errors are active
+
+Use event time for incident semantics and ingestion time for pipeline health. Late events should update historical counts without reopening a resolved incident unless the policy explicitly permits it.
+
+Recovery also needs evidence. One successful call after 500 failures is not recovery. Require a healthy interval, a minimum number of calls, or consecutive successful synthetic probes. Record flapping as a state transition instead of repeatedly opening and closing separate incidents.
+
+## Pattern 3: separate notification grouping from evidence retention
+
+The event, incident, and notification are different records:
+
+1. **Event:** one tool call, drift observation, or synthetic result.
+2. **Incident:** a stateful grouping of related events.
+3. **Notification:** a delivery attempt for an incident transition.
+
+Conflating them creates data loss. If the only stored row is “search is failing,” responders cannot calculate the true failure rate, inspect error variants, or determine the exposure window.
+
+A compact event table can retain every call while sampling large payloads. The incident table stores aggregate state. A notification table stores channel, transition, attempt count, and delivery result. That separation lets the system retry a failed Slack delivery without creating a second incident and lets it rebuild incident aggregates after a policy bug.
+
+Notification grouping can then be channel-specific. The pager may receive immediate open and escalation transitions. Slack may receive a five-minute rolling summary. Email may receive one resolved-incident report. They all refer to the same incident ID and underlying events.
+
+Preserve counts by dimension inside the incident. An alert that says “1,842 failures” is less useful than:
+
+- 1,842 failed calls out of 9,610 total
+- 73 affected sessions
+- 1,701 timeouts and 141 rate-limit responses
+- first seen 14:02:11 UTC, last seen 14:18:44 UTC
+- two deployments and one provider region involved
+
+The summary remains short while the evidence remains queryable.
+
+## Guardrails that catch bad dedup logic
+
+Test deduplication with adversarial sequences, not just repeated identical events:
+
+- same tool, different failure classes
+- same error, different environments
+- failure, brief recovery, then recurrence
+- delayed events arriving after resolution
+- a low-volume failure becoming high-volume
+- an incident key changing after a deployment
+- notification delivery failing while incident processing succeeds
+
+Measure the deduplicator itself. Track incoming events, grouped events, incidents opened, incidents escalated, notifications attempted, notifications delivered, and events dropped. A conservation check should explain every qualifying event as grouped, ignored by policy, or rejected with an explicit reason.
+
+Cardinality limits matter. A contract path such as `results[847].price` should normalize to `results[].price`; otherwise array indexes create hundreds of incident keys. Apply the same discipline to URLs, tenant identifiers, and provider-generated messages.
+
+## Where this advice does not apply
+
+A small internal tool with ten calls per day may not need an incident state machine. A simple threshold and a short cooldown can be easier to operate. Batch systems may also need job-oriented grouping rather than time windows: all failures for one import run belong together even if the run lasts six hours.
+
+Security alerts require different caution. Two events that look operationally identical may represent distinct actors or targets. Deduplication should not collapse forensic identity, and notification suppression may need stricter escalation rules.
+
+Finally, deduplication cannot fix a bad threshold. If a harmless optional-field addition opens an incident every hour, classify the shape change correctly before adding a longer cooldown.
+
+ToolPulse can supply the tool name, failure class, shape diff, latency, and synthetic-check state needed for bounded incident keys. The important design choice happens after collection: retain the observations, group them into stateful incidents, and deduplicate only the messages humans must act on.
