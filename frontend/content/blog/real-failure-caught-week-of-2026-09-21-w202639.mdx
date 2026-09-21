@@ -1,0 +1,140 @@
+---
+title: "Real failure caught: week of 2026-09-21"
+slug: "real-failure-caught-week-of-2026-09-21-w202639"
+date: "2026-09-21"
+description: "A real drift event or reliability issue caught on our own monitored stack this week."
+category: "case-study"
+tags: ['case-study', 'real-failure']
+author: "ToolPulse"
+generatedBy: "content-engine v1"
+---
+
+**Data note:** the ToolPulse production database contained zero tool calls and zero drift events in the seven-day window checked on September 21, 2026. The incident below is therefore a reconstruction, not a claim about live customer traffic. It exercises the same monitoring path against a common dependency failure: a numeric relevance score changing to a string.
+
+## The setup
+
+The reconstructed agent has one external dependency, exposed internally as `external_search`. The tool accepts a query and returns ranked records:
+
+```json
+{
+  "results": [
+    {
+      "id": "doc_184",
+      "score": 0.87,
+      "title": "Retry budgets for tool calls"
+    }
+  ],
+  "request_id": "req_92d1"
+}
+```
+
+The agent filters out results below `0.65`, sorts the remaining records by `score`, and gives the top three titles to the model. The tool is wrapped with ToolPulse, which records duration, success, and a value-free response-shape fingerprint. A scheduled probe runs every 15 minutes with a fixed query whose content is safe to log.
+
+The availability check is deliberately weak: receive a response within 2 seconds and find a non-empty `results` array. The structural baseline is stronger: each result should include string `id`, numeric `score`, and string `title`.
+
+## The drift
+
+At 02:10 UTC in the reconstruction, the upstream service deploys a serializer change. Relevance scores are formatted to two decimal places before JSON encoding. The payload becomes:
+
+```json
+{
+  "results": [
+    {
+      "id": "doc_184",
+      "score": "0.87",
+      "title": "Retry budgets for tool calls"
+    }
+  ],
+  "request_id": "req_92d1"
+}
+```
+
+The endpoint still returns HTTP 200. Median latency remains near 180 ms. The result count is unchanged. An uptime monitor sees a healthy service.
+
+The shape diff is one line:
+
+```diff
+ results[].score: number -> string
+```
+
+This is the kind of change that looks harmless in a browser and is dangerous at a typed or arithmetic boundary.
+
+## What broke
+
+The agent’s filtering code compares the returned score with a floating-point threshold:
+
+```python
+qualified = [
+    item for item in response["results"]
+    if item["score"] >= 0.65
+]
+```
+
+In Python, comparing a string with a float raises `TypeError`. In a loosely validated JavaScript path, later sorting or arithmetic may coerce the value and fail less visibly. Either way, the response is structurally incompatible with the assumption encoded by the caller.
+
+The direct failure is easy to repair. The secondary behavior is worse: the orchestration layer retries the complete tool call twice before returning a generic “search unavailable” answer. One malformed response therefore becomes three upstream requests and roughly 700 ms of avoidable work before model time is counted.
+
+If the exception is swallowed and the agent continues with an empty result set, the visible symptom changes from an error to a low-quality answer. Success-rate monitoring at the HTTP boundary still reports 100 percent.
+
+## What ToolPulse caught
+
+At 02:15 UTC, the next scheduled probe completes in 176 ms and satisfies the basic availability assertion. During the same call, ToolPulse normalizes the response and compares its fingerprint with the last accepted baseline.
+
+The fingerprint changes because the scalar type under `results[].score` changed. The alert is classified as a type change rather than a new field, so it is treated as breaking. The useful payload is the path-level diff, not two opaque hashes:
+
+```text
+external_search response drift
+baseline: results[].score = number
+observed: results[].score = string
+first observed: 2026-09-21T02:15:00Z
+probe latency: 176 ms
+```
+
+Three surrounding signals narrow the diagnosis:
+
+1. latency did not move materially, so a timeout or overloaded dependency is unlikely;
+2. HTTP success remained 100 percent, so transport and authentication are unlikely;
+3. only the response shape changed, and the changed path is used by filtering code.
+
+The alert arrives before the reconstructed 08:00 UTC traffic peak. No customer request is needed to discover the new contract.
+
+## The fix
+
+The immediate mitigation is defensive parsing at the integration boundary:
+
+```python
+from decimal import Decimal, InvalidOperation
+
+
+def normalize_score(value: object) -> float:
+    if isinstance(value, bool):
+        raise ValueError("boolean is not a score")
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(Decimal(value))
+        except InvalidOperation as exc:
+            raise ValueError("invalid score string") from exc
+    raise ValueError(f"unsupported score type: {type(value).__name__}")
+```
+
+The adapter accepts numeric strings temporarily, emits a counter for coercions, and rejects values outside the expected range of zero through one. The team also pins a contract fixture in CI for both the original numeric response and the temporary compatibility path.
+
+The upstream owner is asked to restore numeric JSON encoding. The new string shape is not promoted to the permanent baseline merely because it appeared. Baseline approval happens only after the consumer contract and upstream intent agree.
+
+In this reconstruction, the probe detects drift at 02:15, the adapter is ready at 02:31, and the upstream serializer is reverted at 02:44. Time from detection to compatibility patch is 16 minutes; time to upstream restoration is 29 minutes.
+
+Those timestamps are scenario values, not production measurements. Their purpose is to make the operating sequence testable.
+
+## What this argues for
+
+First, status codes are not contracts. The most damaging agent-tool failures can arrive in fast, successful responses.
+
+Second, synthetic calls matter when traffic is sparse or concentrated. A production-only monitor detects the first affected user. A scheduled probe can detect the dependency change between traffic windows.
+
+Third, automatic baseline promotion should be conservative. Learning every observed shape without review converts drift detection into drift acceptance. Added optional fields may be safe to learn automatically; removed fields, type changes, and container changes usually are not.
+
+Fourth, alert text should name the changed path and type. Engineers can act on `results[].score: number -> string`. They cannot act quickly on “fingerprint mismatch” without another investigation step.
+
+Finally, reconstructed cases should stay labeled as reconstructed. No live telemetry supported a real-incident claim this week. The useful result is still concrete: one controlled probe, one structural diff, and one integration boundary where a successful response would have broken the agent.
