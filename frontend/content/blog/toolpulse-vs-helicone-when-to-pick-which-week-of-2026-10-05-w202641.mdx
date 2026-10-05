@@ -1,0 +1,134 @@
+---
+title: "ToolPulse vs Helicone: when to pick which (week of 2026-10-05)"
+slug: "toolpulse-vs-helicone-when-to-pick-which-week-of-2026-10-05-w202641"
+date: "2026-10-05"
+description: "Honest, side-by-side comparison of ToolPulse and Helicone for AI agent observability."
+category: "comparison"
+tags: ['helicone', 'comparison', 'observability']
+author: "ToolPulse"
+generatedBy: "content-engine v1"
+---
+
+**Short version:** Helicone is the broader choice when model routing, request logging, cost analysis, and multi-step LLM sessions are the center of the problem. ToolPulse is the narrower choice when the risk sits at the agent-tool boundary: a callable gets slow, starts failing, or returns a structurally incompatible payload.
+
+## One sentence on each product
+
+**ToolPulse** wraps Python and TypeScript tools, records latency and outcomes, fingerprints response structure, and runs scheduled probes so teams can detect tool failures and schema drift before an agent acts on bad data.
+
+**Helicone** combines an LLM gateway with request observability, model routing, cost and latency analysis, and session views for tracing multi-step AI workflows.
+
+Both improve visibility into production AI systems. They instrument different control points.
+
+## Where they overlap
+
+Both products can help answer a basic incident question: which dependency made this agent run fail?
+
+An agent may call a model, retrieve account data, invoke `external_search`, call another model, and then write a result. If `external_search` takes 6.2 seconds or throws on half its calls, either platform can contribute useful evidence when the tool operation is represented in the observed workflow.
+
+The overlap includes:
+
+- latency and error visibility;
+- grouping related operations into an agent run or session;
+- enough metadata to correlate a failing step with a user-visible outcome;
+- operational dashboards for identifying recurring regressions;
+- support for investigating tool use inside multi-step AI applications.
+
+That overlap does not make the products interchangeable. A trace that contains a tool response is not automatically a monitored contract for that response.
+
+## Where they diverge
+
+### Helicone starts at the model request and gateway
+
+Helicone's current quickstart centers on an OpenAI-compatible AI Gateway. The application sends model requests through one endpoint, and Helicone provides logging, provider access, routing, fallbacks, and observability around those requests. Its Sessions feature groups related model and tool activity so engineers can inspect a complete workflow rather than isolated API calls.
+
+That is useful when the operating questions are:
+
+- Which model or provider caused the latency spike?
+- How much did this workflow cost?
+- Where did a multi-step agent retry or branch?
+- Which prompts and responses preceded a bad outcome?
+- Should traffic fail over to another model?
+
+ToolPulse does not attempt to be a model gateway. It does not replace provider routing, token-cost analysis, prompt inspection, or a full session trace.
+
+### ToolPulse starts at the callable contract
+
+ToolPulse sits directly around a tool function:
+
+```python
+from toolpulse import monitor
+
+@monitor(name="external_search")
+async def external_search(query: str):
+    return await search_client.query(query)
+```
+
+That boundary may wrap an HTTP API, database lookup, MCP tool, internal service, or deterministic function. ToolPulse records whether the call worked, how long it took, and what structural shape came back.
+
+A response can be fast and successful at the transport layer while still being unsafe for the agent:
+
+```diff
+- results[].confidence: number
++ results[].confidence: string
+```
+
+A gateway can record both payloads. ToolPulse is designed to turn that structural difference into a first-class drift signal without treating every changed value as a new contract.
+
+### Scheduled probes change the detection point
+
+Helicone primarily observes AI application traffic flowing through its integrations. ToolPulse also runs controlled tool checks on a schedule.
+
+That matters for low-volume dependencies. Suppose a payroll assistant calls `benefits_lookup` only during weekday business hours. If the vendor changes its authentication scheme at 02:00 UTC, production-only observation discovers the problem when the first employee arrives. A 15-minute synthetic probe can discover it earlier.
+
+A team can build synthetic traffic around any observability platform. The difference is whether tool-specific scheduling, structural baselines, and drift assertions are part of the product's central workflow or additional infrastructure the team must own.
+
+### The retained data has a different emphasis
+
+Helicone is useful precisely because it can expose model requests, responses, session paths, costs, and timing. That depth creates decisions around redaction, retention, and access control.
+
+ToolPulse can operate on value-free shapes such as:
+
+```json
+{"results": [{"id": "string", "confidence": "number"}]}
+```
+
+This does not eliminate privacy risk because field names and metadata can still be sensitive. It does reduce the need to retain complete tool payloads when the monitoring question is structural compatibility.
+
+## 60-second decision guide
+
+**Pick ToolPulse if:**
+
+- your highest-risk failures are external tools changing shape or behavior;
+- you need scheduled checks even when no production request is active;
+- you want a small wrapper around a defined set of Python or TypeScript callables;
+- path-level schema diffs are more useful than another general trace view;
+- model routing and prompt analytics already live elsewhere.
+
+**Pick Helicone if:**
+
+- you want an LLM gateway as the main integration point;
+- model-provider routing, fallbacks, cost, and token usage are primary concerns;
+- engineers need to debug complete multi-step sessions;
+- prompt and response inspection is part of the incident workflow;
+- broad model-request observability matters more than dedicated response-shape drift.
+
+**Pick neither yet if:**
+
+- the agent is still a prototype with no production owner;
+- ordinary logs identify every failure quickly;
+- the team has no alert response process;
+- the added data-retention surface exceeds the current operational value.
+
+## Should you use both?
+
+Yes, if each owns a distinct question.
+
+Use Helicone for model routing, request economics, and end-to-end session debugging. Use ToolPulse for critical callable health, shape drift, and scheduled probes. Put a shared run identifier in both systems so a ToolPulse alert can lead to the relevant Helicone session.
+
+Avoid duplicating complete prompts, tool payloads, and user identifiers by default. Decide which system needs each field, redact before transmission, and set retention independently.
+
+## What this comparison does not tell you
+
+This is an architectural comparison, not a benchmark or procurement recommendation. It does not measure current hosted pricing, ingestion limits, support quality, gateway overhead, or self-hosting effort under your workload.
+
+Test one representative agent with three injected failures: a provider timeout, a tool response that renames a required field, and a low-traffic dependency that breaks between user requests. Pick the system, or combination, that makes those failures actionable for the engineer carrying the pager.
