@@ -1,0 +1,154 @@
+---
+title: "Real failure caught: week of 2026-10-05"
+slug: "real-failure-caught-week-of-2026-10-05-w202641"
+date: "2026-10-05"
+description: "A real drift event or reliability issue caught on our own monitored stack this week."
+category: "case-study"
+tags: ['case-study', 'real-failure']
+author: "ToolPulse"
+generatedBy: "content-engine v1"
+---
+
+**Data note:** the ToolPulse production database contained zero tool calls and zero drift events during the seven-day window checked on October 5, 2026. The incident below is a reconstruction, not a claim about live customer traffic. It tests a common dependency change: a top-level `results` array being renamed to `items` while the endpoint continues returning HTTP 200.
+
+## The setup
+
+The reconstructed agent uses a tool named `external_search` to retrieve records before a model writes a response. The integration expects this payload:
+
+```json
+{
+  "results": [
+    {
+      "id": "doc_184",
+      "title": "Retry budgets for agent tools",
+      "score": 0.88
+    }
+  ],
+  "request_id": "req_7c2a"
+}
+```
+
+The caller reads `payload["results"]`, rejects records below a score of `0.65`, and sends the top three titles to the model. ToolPulse wraps the callable and records latency, success, and a value-free response-shape fingerprint.
+
+The tool receives little traffic between 00:00 and 11:00 UTC. A scheduled probe runs every 15 minutes with a known-safe query. It checks that the call finishes within 2 seconds, that `results` is a non-empty array, and that each sampled record contains string `id`, string `title`, and numeric `score`.
+
+## The drift
+
+At 03:07 UTC in the reconstruction, the upstream provider releases a new API version behind the existing endpoint. The response becomes:
+
+```json
+{
+  "items": [
+    {
+      "id": "doc_184",
+      "title": "Retry budgets for agent tools",
+      "score": 0.88
+    }
+  ],
+  "request_id": "req_7c2a",
+  "total": 1
+}
+```
+
+The records did not disappear. Their fields and values did not change. The provider renamed the top-level collection and added a count.
+
+Transport-level monitoring stays green. The endpoint returns HTTP 200 in 164 ms. Authentication works. The response contains valid JSON.
+
+The structural diff is small and breaking:
+
+```diff
+- results: array<object>
++ items: array<object>
++ total: integer
+```
+
+The added `total` field is harmless. The renamed collection is not.
+
+## What broke
+
+The adapter assumes the old key exists:
+
+```python
+def select_results(payload: dict) -> list[dict]:
+    return [
+        item
+        for item in payload["results"]
+        if item["score"] >= 0.65
+    ][:3]
+```
+
+The first production call after the deployment raises `KeyError: 'results'`. The orchestration layer retries twice because the exception is classified as a generic tool failure. All three attempts receive the same structurally incompatible payload.
+
+With 180 ms of network time per attempt and 100 ms backoff between attempts, the agent spends roughly 740 ms proving the same deterministic failure three times. It then returns a generic fallback answer without the retrieved evidence.
+
+A more permissive code path could fail less visibly. If the adapter uses `payload.get("results", [])`, the tool call appears successful and the model receives no records. The observable symptom becomes lower answer quality rather than an exception. HTTP success and tool completion both remain green.
+
+## What ToolPulse caught
+
+At 03:15 UTC, the scheduled probe receives the new payload in 158 ms. The transport check passes. The shape fingerprint does not.
+
+ToolPulse compares the normalized response with the last accepted baseline and reports the path-level changes:
+
+```text
+external_search response drift
+removed: results (array<object>)
+added: items (array<object>)
+added: total (integer)
+first observed: 2026-10-05T03:15:00Z
+probe latency: 158 ms
+```
+
+The removed field is classified as breaking. The two added fields are informational until the consumer contract is reviewed.
+
+Three surrounding signals narrow the diagnosis:
+
+1. latency remains within its normal range, so overload is unlikely;
+2. authentication and transport succeed, so credentials and routing are unlikely;
+3. the old required path disappeared while a structurally similar path appeared.
+
+That evidence points to a response-contract change rather than a general outage.
+
+The scheduled check matters because no user traffic occurred between the 03:07 deployment and the 11:00 UTC usage window. Passive monitoring would have made the first user request the detector.
+
+## The fix
+
+The immediate compatibility patch accepts both keys while preserving a metric for the fallback path:
+
+```python
+def select_results(payload: dict) -> list[dict]:
+    if "results" in payload:
+        records = payload["results"]
+        source_key = "results"
+    elif "items" in payload:
+        records = payload["items"]
+        source_key = "items"
+    else:
+        raise ValueError("search response has no result collection")
+
+    if not isinstance(records, list):
+        raise TypeError(f"{source_key} must be a list")
+
+    return [
+        item for item in records
+        if isinstance(item.get("score"), (int, float))
+        and item["score"] >= 0.65
+    ][:3]
+```
+
+The team adds fixtures for both shapes and updates the adapter contract test. It does not automatically promote the new baseline merely because the probe observed it. Baseline approval follows the code change and confirmation that `items` is the provider's intended contract.
+
+In the reconstruction, drift is detected at 03:15, the compatibility patch is ready at 03:31, and the probe returns healthy at 03:36. Time from detection to patch is 16 minutes. The first expected traffic window begins more than seven hours later.
+
+Those timestamps are scenario values, not production measurements.
+
+## What this argues for
+
+First, availability is weaker than compatibility. Fast HTTP 200 responses can be unusable to the caller.
+
+Second, retries should depend on failure class. A timeout may deserve another attempt. A deterministic missing-field error usually does not. Retrying structural failures increases latency and load without improving success.
+
+Third, scheduled checks are most valuable for low-volume, high-impact tools. Production telemetry cannot detect a failure while production is quiet.
+
+Fourth, drift alerts should separate removed, added, and type-changed paths. An added optional field and a removed required collection do not have equal risk.
+
+Finally, reconstructed incidents must remain labeled as reconstructed. No live telemetry supported a real-incident claim this week. The useful result is still testable: one controlled probe, one path-level diff, and one adapter change that prevents a successful response from silently degrading the agent.
