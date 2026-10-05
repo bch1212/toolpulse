@@ -1,0 +1,156 @@
+---
+title: "Synthetic health checks for LLM tools — design and pitfalls"
+slug: "synthetic-health-checks-for-llm-tools-design-and-pitfalls-w202641"
+date: "2026-10-05"
+description: "Technical deep-dive: Synthetic health checks for LLM tools — design and pitfalls"
+category: "deep-dive"
+tags: ['deep-dive', 'engineering']
+author: "ToolPulse"
+generatedBy: "content-engine v1"
+---
+
+A useful synthetic check proves that an agent tool can still satisfy one narrow contract without creating customer-visible side effects. It should detect transport, authentication, latency, and response-shape failures early. It should not pretend that one canned request proves the whole agent works.
+
+## Test the boundary the agent actually depends on
+
+A TCP connection or HTTP 200 is not enough. Agents fail on responses that are available but incompatible: a required field disappears, a list becomes an object, or a numeric score becomes a string.
+
+Start with the assumptions encoded by the caller. For a search tool, those might be:
+
+- the call completes within 2 seconds;
+- the response contains a `results` array;
+- every sampled result has a string `id` and numeric `score`;
+- at least one known-safe query returns a non-empty result;
+- the tool does not return an authentication or quota warning inside a successful response.
+
+The probe should call the same adapter used by the agent, not a lower-level endpoint that bypasses parsing, retries, credentials, or response normalization. Otherwise the check proves the vendor is reachable while the production integration remains broken.
+
+A minimal Python probe can keep the contract explicit:
+
+```python
+from dataclasses import dataclass
+from time import perf_counter
+
+
+@dataclass
+class ProbeResult:
+    ok: bool
+    latency_ms: int
+    reason: str | None = None
+
+
+async def probe_search(search_client) -> ProbeResult:
+    started = perf_counter()
+    try:
+        payload = await search_client.search("toolpulse-probe-safe-query")
+        latency_ms = int((perf_counter() - started) * 1000)
+
+        results = payload.get("results")
+        if not isinstance(results, list):
+            return ProbeResult(False, latency_ms, "results is not a list")
+        if not results:
+            return ProbeResult(False, latency_ms, "known query returned no results")
+
+        first = results[0]
+        if not isinstance(first.get("id"), str):
+            return ProbeResult(False, latency_ms, "results[].id is not a string")
+        if not isinstance(first.get("score"), (int, float)):
+            return ProbeResult(False, latency_ms, "results[].score is not numeric")
+        if latency_ms > 2_000:
+            return ProbeResult(False, latency_ms, "latency budget exceeded")
+
+        return ProbeResult(True, latency_ms)
+    except Exception as exc:
+        latency_ms = int((perf_counter() - started) * 1000)
+        return ProbeResult(False, latency_ms, type(exc).__name__)
+```
+
+This is intentionally narrow. The probe checks one operational contract and returns bounded metadata rather than the complete payload.
+
+## Separate availability, structure, and semantics
+
+A single red or green result hides too much. Record at least three dimensions:
+
+1. **Availability:** Did the call authenticate, connect, and complete?
+2. **Structure:** Does the response still match the parser's assumptions?
+3. **Semantics:** Did the result satisfy a domain assertion?
+
+Structure is usually deterministic. Semantics are not. A weather tool can reliably return a numeric temperature, but asserting an exact value would create false alarms. A search tool can return different rankings for the same query while still being healthy.
+
+Prefer semantic checks that tolerate normal variation:
+
+- a known entity appears in the first 20 results, not necessarily at rank one;
+- a returned timestamp is within an expected range;
+- a price is positive and below a deliberately generous ceiling;
+- a read-after-write test returns the marker created by the probe.
+
+When semantic assertions are probabilistic, run several observations before paging. Three failures in five attempts may be a better incident rule than one failed ranking check.
+
+## Choose probe data that cannot hurt anyone
+
+The hardest problem is often side effects. A synthetic check against `create_invoice`, `send_email`, or `cancel_order` can become a production incident itself.
+
+Use one of these patterns, in descending order of preference:
+
+- a provider-supported validation or dry-run endpoint;
+- a dedicated sandbox with production-equivalent authentication and schemas;
+- a production tenant reserved for probes;
+- a reversible transaction with automatic cleanup;
+- a read-only dependency contract.
+
+Tag every synthetic request with a stable identity such as `probe/tool-name/region`. Exclude it from customer analytics and billing dashboards where appropriate, but do not erase it from reliability telemetry. Engineers need to distinguish probe failures from customer failures without losing the evidence.
+
+Never reuse a real customer's identifier because it is convenient. Synthetic data should be recognizable, bounded, and documented.
+
+## Set frequency from the failure budget
+
+A five-minute interval sounds cautious until the tool costs $0.02 per call across 60 tools and three regions. That schedule produces 51,840 calls per month and about $1,036.80 in direct call cost before observability ingestion.
+
+Frequency should follow detection requirements:
+
+- critical authentication or contract checks: every 5 to 15 minutes;
+- high-cost semantic checks: hourly or daily;
+- low-traffic administrative tools: before the usage window;
+- destructive or difficult-to-clean-up workflows: deployment-time or manual checks.
+
+Add jitter so every probe does not fire at `:00`. A 15-minute schedule with up to 90 seconds of jitter reduces synchronized load and makes the check less likely to measure an artifact of its own traffic.
+
+Timeouts should be stricter than user-visible deadlines but not unrealistically strict. If production abandons a tool after 4 seconds, a 2.5-second warning threshold and a 4-second hard failure can distinguish degradation from outage.
+
+## Retries can hide the failure you need to see
+
+Production adapters often retry transient errors. That is useful for users and dangerous for monitoring if the final result is the only recorded signal.
+
+A probe that succeeds after two retries should not be green without qualification. Record:
+
+- attempt count;
+- latency for each attempt;
+- final outcome;
+- error class for failed attempts;
+- whether fallback credentials, regions, or providers were used.
+
+The user may be protected while the primary dependency is failing. That is a degraded state, not full health.
+
+Avoid synchronized retries. Use bounded exponential backoff with jitter, and cap the probe's total wall-clock budget. A check that retries for 90 seconds may amplify a vendor outage and delay alerting.
+
+## Baselines need review, not blind learning
+
+Shape monitoring is useful only if new observations are not accepted automatically. Promoting every changed response to the baseline converts drift detection into drift acceptance.
+
+A practical policy is:
+
+- added optional field: informational, eligible for automatic acceptance after repeated observation;
+- removed field: breaking until reviewed;
+- scalar type change: breaking until reviewed;
+- array-to-object or object-to-array change: breaking;
+- empty result set: data-quality signal, not enough evidence to replace the element-shape baseline.
+
+Store a path-level diff alongside the fingerprint. `results[].score: number -> string` is actionable. `hash changed` is not.
+
+## Where this advice does not apply
+
+Synthetic checks are not a replacement for real-user monitoring, distributed traces, evaluation datasets, or business metrics. They cover the scenarios you anticipated. Production traffic discovers combinations you did not.
+
+They are also a poor fit when a tool cannot be exercised safely, when every call has a high external cost, or when a sandbox differs materially from production. In those cases, contract tests during deployment plus passive production monitoring may provide a better risk-to-cost ratio.
+
+The operating rule is simple: use a synthetic probe to test one important contract earlier than a customer would. ToolPulse combines that schedule with latency, outcome, and response-shape monitoring so the alert says what changed, not merely that a cron job failed.
