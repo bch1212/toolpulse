@@ -1,0 +1,162 @@
+---
+title: "Real failure caught: week of 2026-10-12"
+slug: "real-failure-caught-week-of-2026-10-12-w202642"
+date: "2026-10-12"
+description: "A reconstructed response-shape drift drill, including detection, impact, and remediation."
+category: "case-study"
+tags: ['case-study', 'real-failure']
+author: "ToolPulse"
+generatedBy: "content-engine v1"
+---
+
+Production telemetry contained no tool calls or drift events during the prior seven days. Rather than invent an incident, this case study documents a reconstructed failure drill against a representative `external_search` integration. Its measurements are from that drill, not live customer traffic.
+
+## The setup
+
+The test agent researches vendor documentation before producing a short technical answer. Its `external_search` tool returns ranked results:
+
+```json
+{
+  "results": [
+    {
+      "id": "doc_784",
+      "title": "API migration guide",
+      "score": 0.93,
+      "url": "https://example.invalid/docs/migration"
+    }
+  ],
+  "next_cursor": null
+}
+```
+
+The agent applies a minimum score of `0.75`, keeps the top five results, and passes their content to the model. ToolPulse wraps the call and records latency, success, and a shape fingerprint. The drill also runs a synthetic search every five minutes so the dependency is exercised without user traffic.
+
+The baseline used 240 replayed calls on October 8, 2026. Median latency was 312 ms, p95 was 684 ms, and every successful response used a numeric `results[].score` field.
+
+## The drift
+
+At 14:07:12 UTC on October 9, the simulated provider switched its score serializer from JSON number to JSON string:
+
+```diff
+ {
+   "results": [
+     {
+       "id": "doc_784",
+       "title": "API migration guide",
+-      "score": 0.93,
++      "score": "0.93",
+       "url": "https://example.invalid/docs/migration"
+     }
+   ],
+   "next_cursor": null
+ }
+```
+
+The HTTP response remained 200. Latency improved slightly because the replay fixture was smaller: the first changed response completed in 286 ms. A conventional uptime check would have called it healthy.
+
+The structural fingerprint changed because `results[].score` moved from number to string. The drill required three matching observations before paging to avoid a one-off malformed response.
+
+The third changed response arrived at 14:07:50 UTC. ToolPulse emitted the drift alert 38 seconds after the first changed response.
+
+## What broke
+
+The integration had two code paths.
+
+The primary path used a strict comparison:
+
+```python
+qualified = [item for item in results if item["score"] >= 0.75]
+```
+
+That path raised `TypeError` when it compared a string with a float. The caller caught the exception and returned an empty result set so the agent could continue. From the outside, the agent did not crash. It answered with generic model knowledge and no current sources.
+
+The fallback path normalized values with `str()` before sorting. It did not raise, but it sorted lexically. Most decimal strings between zero and one happen to retain the expected order, which made the bug less obvious in a small sample. Values such as `"1"`, `"0.95"`, and vendor sentinel strings such as `"unknown"` made the ordering unsafe.
+
+During the drill, 14 calls used the changed contract before the integration was disabled:
+
+- Nine calls took the strict path and returned zero qualifying results.
+- Five calls used the fallback path and completed with untrusted ordering.
+- The HTTP success rate remained 100%.
+- Application-level useful-result rate fell from 98.8% in the baseline replay to 35.7%.
+- Tool latency did not regress.
+
+This is the failure mode worth protecting against: the transport remained healthy while the semantic contract stopped being safe for the caller.
+
+## What ToolPulse caught
+
+The alert contained the tool name, baseline fingerprint, new fingerprint, first-seen time, and the field-level type change:
+
+```text
+external_search response shape changed
+results[].score: number -> string
+first seen: 2026-10-09T14:07:12Z
+observations: 3
+```
+
+Three signals narrowed the diagnosis:
+
+1. **Shape drift changed immediately.** The response contract moved at the first affected call.
+2. **Latency stayed inside its normal range.** The provider was not timing out or queueing.
+3. **HTTP success stayed at 100%.** Availability monitoring alone could not explain the quality drop.
+
+The synthetic check mattered because the drill generated no user traffic between 14:00 and 14:30 UTC. Without the scheduled probe, detection would have waited for the next real request. The first user would have been the monitor.
+
+The alert identified a contract change at the boundary where the integration's assumptions lived. A replay then reproduced the empty-result behavior in under three minutes.
+
+## The fix
+
+At 14:11 UTC, the integration owner disabled the provider in the agent's tool-selection policy and routed searches to the fallback dependency. The agent remained available with lower result coverage.
+
+The permanent parser change accepted numeric strings only when they matched a strict decimal pattern and converted cleanly to a finite float:
+
+```python
+import math
+import re
+
+DECIMAL = re.compile(r"^(?:0|1)(?:\.\d+)?$")
+
+
+def parse_score(value: object) -> float:
+    if isinstance(value, bool):
+        raise ValueError("boolean is not a score")
+
+    if isinstance(value, (int, float)):
+        score = float(value)
+    elif isinstance(value, str) and DECIMAL.fullmatch(value):
+        score = float(value)
+    else:
+        raise ValueError(f"unsupported score value: {value!r}")
+
+    if not math.isfinite(score) or not 0 <= score <= 1:
+        raise ValueError(f"score outside [0, 1]: {score}")
+
+    return score
+```
+
+The team added contract fixtures for numeric values, numeric strings, `null`, booleans, `"unknown"`, values above one, and missing fields. It also separated transport success from application validity: a 200 response with no parseable scored results now records a failed tool outcome.
+
+The patched integration passed replay tests at 14:27 UTC. The provider was re-enabled at 14:31 UTC, 24 minutes after the first changed response.
+
+## What this argues for
+
+### A 200 response is not a reliability result
+
+Transport status answers whether bytes arrived. Agents need to know whether those bytes still satisfy the assumptions in code. Validate fields at the tool boundary and record invalid contracts as failures.
+
+### Type promotion can be as dangerous as field removal
+
+Teams often watch for missing keys. A field that remains present but changes from number to string can bypass shallow checks and fail later, after the agent has already made decisions with it.
+
+### Synthetic checks need realistic assertions
+
+A probe that only checks status and latency would have passed this incident. The synthetic transaction should execute the parser or validate the expected response contract, not merely ping the endpoint.
+
+### Fallbacks need independent validation
+
+The strict path failed loudly. The permissive fallback continued with unsafe ordering. Fallback code often receives less production traffic and less test coverage, even though it runs during incidents when evidence is already limited.
+
+### Monitoring should distinguish observation from fact
+
+This post is a controlled reconstruction because there was no production event to report. Reliability writing should identify which numbers came from live telemetry, a drill, or estimates. A fabricated customer incident would be worse than an empty weekly report.
+
+The drill's result is narrow: a response-type change was detectable within 38 seconds, reproducible within minutes, and containable without waiting for an HTTP outage. That is enough evidence to keep contract drift beside latency and availability in the tool's incident policy.
