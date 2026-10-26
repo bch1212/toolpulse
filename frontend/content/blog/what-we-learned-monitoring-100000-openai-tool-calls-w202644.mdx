@@ -1,0 +1,211 @@
+---
+title: "What we learned monitoring 100,000 OpenAI tool calls"
+slug: "what-we-learned-monitoring-100000-openai-tool-calls-w202644"
+date: "2026-10-26"
+description: "A controlled 100,000-call workload model for sizing tool telemetry, sampling, buffers, and schema-drift monitoring."
+category: "deep-dive"
+tags: ['deep-dive', 'engineering']
+author: "ToolPulse"
+generatedBy: "content-engine v1"
+---
+
+The first lesson from 100,000 tool calls is that the count proves nothing by itself. A six-figure dataset can still hide rare failures, overwhelm a badly sized telemetry queue, or produce confident-looking percentiles from the wrong population.
+
+This article uses a controlled 100,000-call workload model. It is not a claim that ToolPulse received 100,000 new production calls this week; the production API had no ingest traffic during the review window. The point is to make the capacity and reliability decisions explicit before real traffic makes them expensive.
+
+The “OpenAI tool call” here is the application-side execution that follows a model's tool-call request. The model proposes a function and arguments. Your code executes the function. That function boundary is where latency, exceptions, output shape, and contract validity can be measured consistently.
+
+## Define one bounded event
+
+A useful tool-call event needs less data than a full trace:
+
+```json
+{
+  "tool_name": "external_search",
+  "agent_id": "research-agent",
+  "latency_ms": 418,
+  "success": true,
+  "output_shape": "4917809db2bdb220",
+  "called_at": "2026-10-26T13:00:00Z"
+}
+```
+
+Add a trace identifier if one exists. Add a bounded error class on failure. Do not default to recording raw arguments and complete responses.
+
+At an average serialized size of 850 bytes, 100,000 events are 85,000,000 bytes, or about 81.1 MiB, before database indexes, replication, transport framing, and backups. That is manageable. Capturing a 50 KiB tool response on every event is a different system.
+
+The event schema should answer four questions:
+
+1. Did the tool complete successfully?
+2. How long did it take?
+3. Did the response structure match the established contract?
+4. Can this event be correlated with the parent run?
+
+Everything else needs a reason to exist.
+
+## Instrumentation overhead is cumulative
+
+Five milliseconds sounds negligible beside a one-second API call. Across 100,000 calls, five milliseconds per call is 500 seconds of aggregate added latency. Concurrency prevents users from waiting through those 500 seconds sequentially, but the CPU, scheduling, allocation, and tail-latency cost still exists.
+
+Keep synchronous work on the hot path bounded:
+
+- Read one monotonic start timestamp.
+- Execute the tool.
+- Read one end timestamp.
+- Extract a value-free shape tree.
+- Enqueue a compact event without waiting for network I/O.
+
+Avoid synchronous telemetry delivery inside the wrapped function. An observability endpoint should not become a new dependency in the user's request path.
+
+A minimal asynchronous recorder can look like this:
+
+```python
+import asyncio
+from collections.abc import Awaitable, Callable
+from time import perf_counter_ns
+
+queue: asyncio.Queue[dict] = asyncio.Queue(maxsize=20_000)
+dropped_events = 0
+
+
+async def monitored_call(
+    tool_name: str,
+    call: Callable[[], Awaitable[object]],
+) -> object:
+    global dropped_events
+    started = perf_counter_ns()
+    ok = False
+
+    try:
+        result = await call()
+        ok = True
+        return result
+    finally:
+        event = {
+            "tool_name": tool_name,
+            "success": ok,
+            "latency_ms": (perf_counter_ns() - started) / 1_000_000,
+        }
+        try:
+            queue.put_nowait(event)
+        except asyncio.QueueFull:
+            dropped_events += 1
+```
+
+The missing line in many implementations is the dropped-event counter. A bounded queue without a loss metric converts overload into silent data corruption.
+
+## Average throughput is not the sizing number
+
+Suppose the exporter drains 1,000 events per second. That sounds sufficient for an application averaging 600 calls per second.
+
+Now model a deployment burst at 5,000 calls per second for 30 seconds:
+
+- Incoming events: 150,000.
+- Events drained during the burst: 30,000.
+- Backlog created: 120,000.
+- Events lost with a 20,000-event buffer: 100,000.
+
+The average rate did not protect the queue. The burst shape determined the loss.
+
+There are only a few honest policies:
+
+- Increase the buffer and accept more memory use.
+- Increase exporter throughput.
+- Spill to a durable local queue.
+- Sample successful repetitive events.
+- Drop events and expose the exact loss count.
+- Apply backpressure and accept application latency.
+
+For most agent tools, blocking the user because monitoring is slow is the wrong default. Dropping some successful telemetry can be acceptable if counters, errors, new fingerprints, and loss metrics are preserved.
+
+## Uniform sampling hides the failures you wanted
+
+Assume 0.2% of 100,000 calls have a rare failure mode. That is 200 failures.
+
+If every event is independently retained at 1%, the probability of retaining none of those 200 failures is about 13.4%. A one-percent sample can therefore produce a clean dataset even though 200 users hit the problem.
+
+Use separate retention policies by signal:
+
+- Keep aggregate counters and latency histograms for every call.
+- Keep every failed call up to a safety cap.
+- Keep every previously unseen response fingerprint.
+- Keep events around deployments and alerts.
+- Sample repetitive successful calls after aggregates are updated.
+- Retain a bounded exemplar for each common shape and error class.
+
+Sampling before the denominator is recorded is a common mistake. If only sampled rows reach storage and the dashboard treats them as the full population, error rates and call counts become estimates without being labeled as estimates.
+
+## Shape changes and value changes are different signals
+
+A shape fingerprint should be stable when values change and sensitive when the structure changes.
+
+These responses should share a fingerprint:
+
+```json
+{"temperature": 72, "condition": "clear"}
+{"temperature": 19, "condition": "rain"}
+```
+
+This response should not:
+
+```json
+{"temperature": "19", "condition": "rain"}
+```
+
+The first pair changes data. The third changes the caller's type contract.
+
+Shape monitoring does not detect every semantic failure. A search result can keep the same fields and become less relevant. A fraud score can remain a float while its calibration drifts. A model can choose the wrong tool even when every tool is healthy.
+
+That is why tool reliability should sit beside, not replace, traces and evaluations:
+
+- Traces reconstruct the run.
+- Evaluations measure behavioral quality.
+- Tool monitoring checks the callable dependency.
+
+## Cardinality needs a budget too
+
+The fastest way to make 100,000 events expensive is to turn unbounded values into metric labels.
+
+Reasonable dimensions include:
+
+- tool name
+- environment
+- bounded agent version
+- success or failure
+- bounded error class
+
+Dangerous dimensions include:
+
+- user ID
+- request ID
+- raw URL
+- exception message
+- prompt text
+- arbitrary tool arguments
+
+High-cardinality values belong in sampled events or traces with explicit retention, not in every time-series label set.
+
+Apply the same rule to tool names. A name such as `fetch_customer_847291` is not a tool name; it is a customer identifier smuggled into a dimension. Normalize it to `fetch_customer` and keep the identifier out of the metrics path.
+
+## Percentiles need attempts and operations
+
+Tool retries create two latency populations:
+
+1. Attempt latency: how long each individual call took.
+2. Operation latency: how long the user waited across retries and backoff.
+
+If an operation succeeds on the third attempt, a dashboard of successful attempt latency may look healthy while the user waits through two timeouts. Record retry count and correlate attempts to the logical operation.
+
+Do not average p95 values from separate workers or regions. Merge histograms or sketches that preserve the distribution. An average of percentiles is not the percentile of the combined calls.
+
+Always show the call count beside p95 and p99. A p99 based on 37 observations should not carry the same visual confidence as one based on 37,000.
+
+## Where this advice does not apply
+
+A low-risk internal agent making a few hundred calls per week may not need a queue, adaptive retention, fingerprints, and histogram merging. Structured logs plus contract tests can be simpler and sufficient.
+
+A regulated workflow may require more payload retention for auditability, but that does not justify indiscriminate collection. It requires a documented schema, access controls, encryption, retention limits, and redaction rules.
+
+A full distributed system may already have OpenTelemetry infrastructure that can carry tool spans. Keep using it. The remaining question is whether the trace pipeline also treats response-shape drift and synthetic tool checks as first-class signals.
+
+The practical result of the 100,000-call model is not “store everything.” It is “protect the denominator, retain rare failures, bound the hot path, and make telemetry loss observable.” Tool monitoring fails when it becomes slower or less trustworthy than the tools it is supposed to measure.
