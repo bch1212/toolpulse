@@ -1,0 +1,222 @@
+---
+title: "Real failure caught: week of 2026-10-26"
+slug: "real-failure-caught-week-of-2026-10-26-w202644"
+date: "2026-10-26"
+description: "A controlled response-shape drift drill showing how a list-to-object API change can produce empty agent context while HTTP remains healthy."
+category: "case-study"
+tags: ['case-study', 'real-failure']
+author: "ToolPulse"
+generatedBy: "content-engine v1"
+---
+
+There was no live customer incident to report this week. Production API HTTP logs contained no ingest requests during the prior seven days, and the public status query returned no monitored-tool rows at 13:07 UTC on October 26, 2026. This post documents a controlled failure drill executed against ToolPulse's current Python shape-fingerprint code. The payloads, counts, and fingerprints below come from that drill, not customer traffic.
+
+The failure is common because it looks harmless at the transport layer: a provider wraps an existing result list in a new object. HTTP stays 200. JSON remains valid. The agent loses its source material.
+
+## The setup
+
+The test agent calls `external_search` and keeps results with a score of at least `0.75`:
+
+```python
+def select_results(response: dict) -> list[dict]:
+    try:
+        return [
+            item
+            for item in response["results"]
+            if item["score"] >= 0.75
+        ]
+    except (KeyError, TypeError):
+        return []
+```
+
+The exception handler was intended to keep the agent available during provider errors. It converted contract violations into an empty result set.
+
+The baseline response was:
+
+```json
+{
+  "results": [
+    {
+      "id": "doc_784",
+      "title": "API migration guide",
+      "score": 0.93
+    }
+  ],
+  "next_cursor": null
+}
+```
+
+The drill replayed 240 successful baseline responses through the parser and ToolPulse's current `extract_shape`, `fingerprint`, and `shape_diff` functions. All 240 baseline calls returned a usable result.
+
+The baseline fingerprint was:
+
+```text
+4917809db2bdb220
+```
+
+That gave the detector far more than its minimum baseline requirement of five successful observations.
+
+## The drift
+
+The simulated provider changed `results` from a list to an object containing an `items` list:
+
+```diff
+ {
+-  "results": [
+-    {
+-      "id": "doc_784",
+-      "title": "API migration guide",
+-      "score": 0.93
+-    }
+-  ],
++  "results": {
++    "items": [
++      {
++        "id": "doc_784",
++        "title": "API migration guide",
++        "score": 0.93
++      }
++    ]
++  },
+   "next_cursor": null
+ }
+```
+
+The new fingerprint was:
+
+```text
+b600aab8c56e2f2f
+```
+
+The current diff implementation produced one structural change:
+
+```text
+results: list<object(3 keys)> -> object(1 keys)
+```
+
+No field disappeared from the nested result itself. The list was moved one level deeper. That is enough to break code written against the original contract.
+
+ToolPulse's current detector compares a new successful response fingerprint with the dominant different shape from the previous 24 hours. With 240 baseline observations already present, the first changed response satisfies the detector's baseline condition. Repeated alerts for the same new fingerprint are deduplicated for one hour.
+
+## What broke
+
+The changed response still passed every shallow availability check:
+
+- The endpoint returned HTTP 200.
+- The body was valid JSON.
+- `results` still existed.
+- The nested result fields kept the same names and types.
+- No network exception occurred.
+
+The parser failed because iterating a dictionary yields its keys. The first `item` became the string `"items"`, and `item["score"]` raised `TypeError`. The broad handler converted that error into `[]`.
+
+The drill replayed 18 changed responses:
+
+- Changed calls: 18.
+- Calls returning at least one usable result: 0.
+- Transport success: 18 of 18.
+- Parser exceptions exposed to the caller: 0.
+
+The agent therefore continued running with empty search context. A likely user-visible symptom is a fluent answer based on model memory instead of current documentation. The service appears available while answer quality and source freshness collapse.
+
+This is more dangerous than a clean exception. A clean exception can trigger a fallback or stop an unsafe action. An empty list often looks like a legitimate “nothing found” result.
+
+## What ToolPulse caught
+
+The shape signal separates the contract failure from availability:
+
+```text
+external_search response shape changed
+baseline: 4917809db2bdb220
+current:  b600aab8c56e2f2f
+changed:  results: list<object(3 keys)> -> object(1 keys)
+```
+
+Three facts narrow the diagnosis:
+
+1. **The fingerprint changed.** The response contract is different even though the request succeeded.
+2. **The changed path is precise.** The result container moved from list to object; nested item fields did not change.
+3. **The application marked the call successful.** The integration's own success definition is too shallow.
+
+The detector does not know whether the new object wrapper is intentional, temporary, or safe. It should not. Its job is to identify that the caller is seeing a shape it was not written against.
+
+The synthetic check should go one step further than fingerprinting. It should run `select_results()` and assert that a known fixture produces at least one validated result. Shape drift explains the contract change; the parser assertion proves the user impact.
+
+## The fix
+
+The first fix is to stop returning an empty list for an unrecognized contract. Empty results and invalid responses are different states.
+
+A strict parser can support both documented layouts while rejecting everything else:
+
+```python
+from typing import Any
+
+
+class SearchContractError(ValueError):
+    pass
+
+
+def select_results(response: dict[str, Any]) -> list[dict[str, Any]]:
+    raw = response.get("results")
+
+    if isinstance(raw, list):
+        items = raw
+    elif isinstance(raw, dict) and isinstance(raw.get("items"), list):
+        items = raw["items"]
+    else:
+        raise SearchContractError("unsupported results container")
+
+    selected: list[dict[str, Any]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            raise SearchContractError("result is not an object")
+
+        score = item.get("score")
+        if isinstance(score, bool) or not isinstance(score, (int, float)):
+            raise SearchContractError("score is not numeric")
+
+        if score >= 0.75:
+            selected.append(item)
+
+    return selected
+```
+
+The integration should then record `SearchContractError` as a failed tool outcome, not a successful call with zero results.
+
+The regression suite needs fixtures for:
+
+- the original list layout
+- the new `{ "items": [...] }` layout
+- missing `results`
+- `results: null`
+- non-object items
+- missing scores
+- string scores
+- booleans, which Python otherwise treats as integers
+- an empty but structurally valid list
+
+The operational mitigation is to disable or route around the provider until the compatibility adapter passes those fixtures. Do not silently accept every object shape; explicit compatibility is safer than permissive traversal.
+
+This drill did not measure human time-to-resolution, so it would be misleading to publish a fabricated minute count. It did verify the sequence needed for a short incident: the first changed response is structurally distinguishable, the field-level diff points to the parser, and a bounded compatibility adapter restores the expected contract.
+
+## What this argues for
+
+### Success must include contract validity
+
+HTTP success is transport evidence. Tool success should mean the response passed the validation required for the agent to use it safely.
+
+### Empty results are not a universal fallback
+
+An empty list can mean “the search found nothing.” It should not also mean “the response was malformed,” “the parser crashed,” and “the provider changed its API.” Preserve those states separately.
+
+### Container changes deserve the same attention as field changes
+
+Teams often test renamed fields and type promotions. A list wrapped inside an object can break iteration while leaving every nested field unchanged.
+
+### Synthetic checks should execute consumer logic
+
+A probe that checks only status, JSON parsing, or top-level key presence would pass this failure. Run the same validation and selection code used by the agent.
+
+### Monitoring claims need provenance
+
+The production service had no ingest traffic during the review window. The responsible weekly report is a labeled drill with reproducible fixtures, not an invented customer incident. Reliability content is part of the reliability system; its evidence should be inspectable too.
