@@ -1,0 +1,230 @@
+---
+title: "Real failure caught: week of 2026-11-02"
+slug: "real-failure-caught-week-of-2026-11-02-w202645"
+date: "2026-11-02"
+description: "A controlled inventory-contract drift drill showing how a nested availability object can create false out-of-stock results while HTTP remains healthy."
+category: "case-study"
+tags: ['case-study', 'real-failure']
+author: "ToolPulse"
+generatedBy: "content-engine v1"
+---
+
+There was no live customer incident to report this week. A production database query at 14:13 UTC on November 2, 2026 found zero tool-call events, zero drift events, and zero synthetic-check results. This post documents a controlled failure drill executed against ToolPulse's current Python shape-fingerprint code. The payloads, counts, fingerprints, and diff below come from that drill, not customer traffic.
+
+The failure is an inventory API migration that changes two top-level fields into one nested object. HTTP stays 200. JSON remains valid. The integration silently reports an in-stock item as unavailable.
+
+## The setup
+
+The test agent calls `inventory_lookup` before recommending whether a user should place an order. The integration reduces the provider response to an available-unit count:
+
+```python
+def available_units(response: dict) -> int:
+    if not response.get("available", False):
+        return 0
+    return int(response.get("quantity", 0))
+```
+
+The integration is permissive: missing `available` becomes `False`, and missing `quantity` becomes zero. An unknown contract therefore looks like a valid out-of-stock result.
+
+The baseline response was:
+
+```json
+{
+  "sku": "A17",
+  "available": true,
+  "quantity": 12,
+  "warehouse": {
+    "id": "tx-01",
+    "cutoff_at": "2026-11-02T18:00:00Z"
+  }
+}
+```
+
+The drill replayed 300 baseline responses through `available_units()` and ToolPulse's current `extract_shape`, `fingerprint`, and `shape_diff` functions.
+
+Results:
+
+- Baseline calls: 300.
+- Calls returning 12 available units: 300.
+- Parser exceptions: 0.
+- Baseline fingerprint: `09ffd5b8039152ca`.
+
+## The drift
+
+The simulated provider replaced the top-level boolean and quantity with a nested `availability` object:
+
+```diff
+ {
+   "sku": "A17",
+-  "available": true,
+-  "quantity": 12,
++  "availability": {
++    "state": "in_stock",
++    "quantity": 12
++  },
+   "warehouse": {
+     "id": "tx-01",
+     "cutoff_at": "2026-11-02T18:00:00Z"
+   }
+ }
+```
+
+The new response says 12 units are in stock but is incompatible with the old caller.
+
+The changed fingerprint was:
+
+```text
+9d96a9262d984d16
+```
+
+The current diff implementation produced:
+
+```text
+added:
+  availability: object(2 keys)
+
+removed:
+  available: bool
+  quantity: int
+
+changed:
+  none
+```
+
+## What broke
+
+The drill replayed 24 changed responses through the unchanged integration:
+
+- Changed calls: 24.
+- Calls correctly returning 12 units: 0.
+- Calls misclassified as zero units: 24.
+- HTTP failures: 0.
+- JSON parse failures: 0.
+- Application exceptions: 0.
+
+The failure occurs on the first line of business logic:
+
+```python
+response.get("available", False)
+```
+
+Because the new payload has no `available` key, `.get()` returns the default `False`. The function exits with zero before it examines the nested quantity.
+
+From the agent's perspective, the tool call succeeded and the item is unavailable. It may recommend a substitute or tell a customer to wait for restocking even though 12 units are present.
+
+This is a silent failure because every shallow check passes:
+
+- The endpoint is reachable.
+- The status code is 200.
+- The response is valid JSON.
+- The SKU is present.
+- The warehouse object is unchanged.
+- The integration returns a normal integer.
+- No exception reaches the caller.
+
+An uptime monitor or exception tracker will not detect this. A dashboard may show a rise in out-of-stock items without identifying the contract change.
+
+## What ToolPulse caught
+
+The shape signal separates provider contract drift from genuine inventory depletion:
+
+```text
+inventory_lookup response shape changed
+baseline: 09ffd5b8039152ca
+current:  9d96a9262d984d16
+added:    availability: object(2 keys)
+removed:  available: bool
+removed:  quantity: int
+```
+
+Three facts narrow the diagnosis:
+
+1. **The fingerprint changed.** The new payload is structurally different even though the call was marked successful.
+2. **The removed paths match the parser.** Both fields used by `available_units()` disappeared.
+3. **The replacement is visible.** The new `availability` object gives the integration owner an obvious migration target.
+
+The detector does not need to infer the new business semantics. Its job is to show that the trusted contract changed and identify the changed paths.
+
+A synthetic check should then execute the same consumer logic with a known in-stock SKU:
+
+```python
+assert available_units(inventory_lookup("A17")) > 0
+```
+
+A transport-only probe would pass. Running the consumer assertion exposes the user impact.
+
+## The fix
+
+The immediate fix is to reject unknown contracts rather than converting them into zero inventory. The adapter can support both documented versions explicitly:
+
+```python
+from typing import Any
+
+
+class InventoryContractError(ValueError):
+    pass
+
+
+def available_units(response: dict[str, Any]) -> int:
+    if "available" in response or "quantity" in response:
+        available = response.get("available")
+        quantity = response.get("quantity")
+
+        if not isinstance(available, bool):
+            raise InventoryContractError("available must be bool")
+        if isinstance(quantity, bool) or not isinstance(quantity, int):
+            raise InventoryContractError("quantity must be int")
+
+        return quantity if available else 0
+
+    availability = response.get("availability")
+    if isinstance(availability, dict):
+        state = availability.get("state")
+        quantity = availability.get("quantity")
+
+        if state not in {"in_stock", "out_of_stock"}:
+            raise InventoryContractError("unknown availability state")
+        if isinstance(quantity, bool) or not isinstance(quantity, int):
+            raise InventoryContractError("availability.quantity must be int")
+
+        if state == "out_of_stock" and quantity != 0:
+            raise InventoryContractError("out_of_stock with nonzero quantity")
+        if state == "in_stock" and quantity <= 0:
+            raise InventoryContractError("in_stock with nonpositive quantity")
+
+        return quantity
+
+    raise InventoryContractError("unsupported inventory response contract")
+```
+
+The important change is the removal of permissive defaults for contract-defining fields. Missing availability data is not confirmed unavailability.
+
+The integration should record `InventoryContractError` as a failed tool outcome. The agent can then retry a compatible endpoint, use a cached value with an explicit staleness warning, or stop the action instead of inventing a stock state.
+
+The regression suite needs fixtures for both contracts, missing data, unknown states, malformed quantities, and contradictory state-and-quantity combinations.
+
+The synthetic check should run at least one known in-stock and one known out-of-stock item. Testing only the empty path would allow this exact false-negative behavior to remain hidden.
+
+This drill did not measure a human time-to-resolution, so it would be misleading to publish a fabricated minute count. It did verify the diagnostic sequence: the first changed payload produces a new fingerprint, the field-level diff points directly to the parser's dependencies, and a strict compatibility adapter restores the intended result.
+
+## What this argues for
+
+### Missing is not false
+
+Using `.get("available", False)` merges two states: “the provider confirmed unavailable” and “the response did not contain the field.” Those states require different behavior.
+
+### Successful transport is not successful business logic
+
+HTTP 200 proves that bytes arrived. Tool success should mean the response passed the validation required for the agent to use it safely.
+
+### Additive-looking redesigns can be breaking
+
+The new payload added a useful `availability` object, but it also removed two consumed fields. Review diffs from the caller's perspective, not the provider's release-note wording.
+
+### Synthetic checks should exercise decisions
+
+A probe should not stop at status, JSON parsing, or key presence. For high-risk tools, run the same adapter and invariants used by the agent.
+
+### Reliability claims need provenance
+
+The production database contained no telemetry to support a live incident narrative this week. The responsible case study is a labeled, reproducible drill using current code, not an invented customer failure. The evidence standard for reliability content should match the standard expected from the monitoring product itself.
