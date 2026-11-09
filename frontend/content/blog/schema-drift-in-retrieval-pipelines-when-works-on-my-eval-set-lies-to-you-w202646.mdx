@@ -1,0 +1,248 @@
+---
+title: "Schema drift in retrieval pipelines — when 'works on my eval set' lies to you"
+slug: "schema-drift-in-retrieval-pipelines-when-works-on-my-eval-set-lies-to-you-w202646"
+date: "2026-11-09"
+description: "Why stable retrieval evaluations can miss production contract drift, and how to monitor the boundaries between retrieval stages."
+category: "deep-dive"
+tags: ['deep-dive', 'engineering']
+author: "ToolPulse"
+generatedBy: "content-engine v1"
+---
+
+A retrieval evaluation can remain green while the production pipeline is broken. The usual reason is not that the relevance metric is wrong. It is that the evaluation bypasses a contract boundary that changed in production: a search response, metadata field, filter type, embedding dimension, reranker score, or document-normalization step.
+
+“Works on my eval set” is evidence about the path the eval executed. It is not evidence that every production dependency still returns data in the shape the application consumes.
+
+## A retrieval pipeline has more contracts than its final score
+
+A typical retrieval path contains at least five boundaries:
+
+1. The query normalizer produces text and filters.
+2. The embedding service produces a vector.
+3. The vector or keyword index returns candidates.
+4. A reranker produces scores or ordering.
+5. The document adapter produces context for the model.
+
+Teams often evaluate only the end result: expected documents in the top five, answer correctness, citation precision, or a judge-model score. That is necessary, but it collapses several contracts into one outcome.
+
+Suppose an offline evaluation loads frozen candidates from a JSON fixture and runs the current reranker. It can pass even if the live search API renamed `score` to `relevance`, because the fixture still contains `score`. The eval proves that the reranker works with yesterday's contract. It says nothing about today's live boundary.
+
+The same gap appears when:
+
+- an eval uses precomputed embeddings while production calls a changed embedding model;
+- an eval omits tenant or permission filters;
+- an eval reads documents directly from storage while production uses an API adapter;
+- an eval uses complete metadata while live indexing dropped a field;
+- an eval checks ranking but not whether the document body is empty;
+- an eval runs nightly while an upstream service deploys at 14:00 UTC.
+
+The fix is not to abandon offline evaluation. It is to monitor the contracts the eval does not exercise.
+
+## Silent drift is worse than a clean exception
+
+A type error is noisy. A compatible-looking default is quiet.
+
+Consider this selection code:
+
+```python
+def select_documents(response: dict, threshold: float = 0.8) -> list[dict]:
+    return [
+        doc
+        for doc in response.get("documents", [])
+        if float(doc.get("score", 0)) >= threshold
+    ]
+```
+
+The provider changes its payload from:
+
+```json
+{
+  "documents": [
+    {"id": "doc-17", "score": 0.91, "text": "Refunds are available..."}
+  ]
+}
+```
+
+to:
+
+```json
+{
+  "documents": [
+    {
+      "id": "doc-17",
+      "relevance": {"score": "0.91", "model": "reranker-v3"},
+      "text": "Refunds are available..."
+    }
+  ]
+}
+```
+
+The endpoint is up. JSON parsing succeeds. `documents` still exists. The code raises no exception because the missing score defaults to zero. Every candidate falls below the threshold.
+
+An answer-quality evaluation against frozen responses remains green. Production retrieval returns no context and the model either refuses, guesses, or falls back to parametric knowledge.
+
+This is contract drift: the provider may consider the new format valid, but the consumer's assumptions are no longer valid.
+
+## Monitor each boundary with three signals
+
+A useful boundary monitor records three classes of evidence.
+
+### 1. Operational outcome
+
+Record whether the call completed, its latency, and a bounded error category. This catches outages, timeouts, rate limits, and obvious parser failures.
+
+Do not mark a call successful only because HTTP returned 200. Mark it successful after the adapter has validated the fields required by the next stage.
+
+```python
+class RetrievalContractError(ValueError):
+    pass
+
+
+def normalize_candidates(response: dict) -> list[dict]:
+    documents = response.get("documents")
+    if not isinstance(documents, list):
+        raise RetrievalContractError("documents must be a list")
+
+    normalized = []
+    for index, doc in enumerate(documents):
+        if not isinstance(doc, dict):
+            raise RetrievalContractError(f"documents[{index}] must be an object")
+        if not isinstance(doc.get("id"), str):
+            raise RetrievalContractError(f"documents[{index}].id must be a string")
+        if isinstance(doc.get("score"), bool) or not isinstance(doc.get("score"), (int, float)):
+            raise RetrievalContractError(f"documents[{index}].score must be numeric")
+        normalized.append(doc)
+
+    return normalized
+```
+
+Strict validation converts silent empty retrieval into a visible failed tool call.
+
+### 2. Structural fingerprint
+
+Extract keys and value types without retaining values, then hash the canonical shape. Two responses with different document IDs and scores produce the same fingerprint. A renamed or nested field produces a new one.
+
+A simplified implementation looks like this:
+
+```python
+import hashlib
+import json
+
+
+def shape(value):
+    if isinstance(value, dict):
+        return {key: shape(item) for key, item in sorted(value.items())}
+    if isinstance(value, list):
+        return [shape(value[0])] if value else ["__empty__"]
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "bool"
+    if isinstance(value, int):
+        return "int"
+    if isinstance(value, float):
+        return "float"
+    if isinstance(value, str):
+        return "str"
+    return type(value).__name__
+
+
+def fingerprint(value) -> str:
+    canonical = json.dumps(shape(value), sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode()).hexdigest()[:16]
+```
+
+A fingerprint is not validation. It is a change detector. It tells you when to inspect or block a new structure.
+
+### 3. Semantic invariant
+
+Some failures preserve shape. A service can return the same fields with all scores set to zero, empty document text, duplicated IDs, or vectors containing `NaN`.
+
+Add checks tied to the boundary's purpose:
+
+```python
+import math
+
+
+def assert_retrieval_invariants(documents: list[dict]) -> None:
+    ids = [doc["id"] for doc in documents]
+    if len(ids) != len(set(ids)):
+        raise RetrievalContractError("duplicate document ids")
+
+    for doc in documents:
+        score = float(doc["score"])
+        if not math.isfinite(score):
+            raise RetrievalContractError("score must be finite")
+        if not doc.get("text", "").strip():
+            raise RetrievalContractError("document text is empty")
+```
+
+The three signals cover different failure classes. Operational monitoring catches exceptions and latency. Shape monitoring catches structural change. Invariants catch wrong values inside a stable shape.
+
+## Use a live canary, not only a frozen corpus
+
+Keep the offline corpus for repeatable quality measurement. Add a small live canary that crosses the same network and adapter boundaries as production.
+
+For example, run 20 stable queries every 15 minutes:
+
+- five exact-match queries with one known document;
+- five filtered queries that exercise tenant or permission metadata;
+- five semantic queries that should return at least one result above a threshold;
+- five negative queries that should return no result.
+
+That is 1,920 retrieval calls per day. At 250 ms per request, sequential execution would consume eight minutes of service time across the day; parallel execution can keep wall-clock duration small. The exact schedule is workload-dependent. The point is to exercise the live contracts often enough to bound detection time.
+
+Record for each canary:
+
+- request and adapter version;
+- endpoint and index version;
+- latency and outcome;
+- response fingerprint;
+- result count;
+- top score and selected document IDs;
+- invariant failures;
+- correlation ID for downstream traces.
+
+Do not use a secret document that production users cannot access. Use synthetic or public fixtures with stable ownership and explicit cleanup rules.
+
+## Compare distributions, not one magic threshold
+
+A pipeline can degrade without a schema change. Monitor distributions alongside contracts:
+
+- candidate count by query class;
+- fraction of queries with zero results;
+- top-one and top-five score distributions;
+- overlap between first-stage and reranked results;
+- document text length;
+- filter rejection rate;
+- p50, p95, and p99 latency;
+- embedding vector dimension and finite-value rate.
+
+Suppose the zero-result rate rises from 4% to 31% while latency and HTTP success remain stable. That is an operational incident even if the JSON shape did not change. A deployment annotation or provider-version property can narrow the cause.
+
+Avoid global thresholds when query classes differ. A negative-control query should return zero results; a known-document query should not. Segment the metric before alerting.
+
+## Version fixtures and adapters together
+
+A common eval mistake is to update the adapter but leave the fixture provenance unclear. Every stored response should identify:
+
+- provider and endpoint;
+- capture date;
+- schema or API version if available;
+- adapter commit;
+- index and embedding versions;
+- redaction or normalization applied before storage.
+
+When a new response fingerprint appears, capture a sanitized fixture and run it through the adapter's compatibility tests. If both old and new contracts are supported, test both explicitly. If only the new contract is valid, fail closed on the old one after the migration window.
+
+Do not quietly regenerate the entire eval set after a provider change. That can erase the evidence that the contract moved.
+
+## Where this advice does not apply
+
+A small internal prototype may be adequately covered by strict parsing, application logs, and a handful of integration tests. A fully controlled monolith with no external retrieval dependency has fewer runtime contract risks. Some APIs publish strong version guarantees and generated clients that turn drift into compile-time or immediate parser failures.
+
+Shape fingerprints also produce noise when optional fields legitimately vary. The detector needs a baseline policy that can represent optional keys, unions, and approved migrations. It should not page on every additive metadata field.
+
+Finally, retrieval quality cannot be reduced to contracts. A stable schema can still return stale, biased, unauthorized, or irrelevant documents. Keep answer-quality evaluation, human review, access-control testing, and data freshness checks.
+
+The practical rule is narrower: an eval score is only evidence for the path the eval actually ran. Monitor every live boundary it skips, validate required fields before declaring success, and combine shape change with semantic invariants. ToolPulse's role is to make those dependency changes visible before a quiet default turns retrieval into an empty context window.
