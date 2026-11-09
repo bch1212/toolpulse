@@ -1,0 +1,258 @@
+---
+title: "Real failure caught: week of 2026-11-09"
+slug: "real-failure-caught-week-of-2026-11-09-w202646"
+date: "2026-11-09"
+description: "A controlled retrieval-contract drift drill showing how a nested string score can silently remove every relevant document while HTTP remains healthy."
+category: "case-study"
+tags: ['case-study', 'real-failure']
+author: "ToolPulse"
+generatedBy: "content-engine v1"
+---
+
+No verified live customer incident was available for publication this week. This post documents a controlled failure drill executed on November 9, 2026 against ToolPulse's current Python shape-fingerprint code. The payloads, counts, fingerprints, and diff below came from that drill, not customer traffic.
+
+The failure is a retrieval API migration that moves `documents[].score` into a nested `relevance` object and changes the score from a number to a string. HTTP remains 200. JSON remains valid. The integration silently removes every relevant document from the model's context.
+
+## The setup
+
+A support agent calls `retrieval_search` before answering policy questions. The adapter keeps documents whose score is at least 0.8:
+
+```python
+def selected_ids(response: dict, threshold: float = 0.8) -> list[str]:
+    return [
+        doc["id"]
+        for doc in response.get("documents", [])
+        if float(doc.get("score", 0)) >= threshold
+    ]
+```
+
+The code is permissive. A missing `score` becomes zero instead of becoming a contract error.
+
+The baseline response was:
+
+```json
+{
+  "query": "refund policy",
+  "documents": [
+    {
+      "id": "doc-17",
+      "title": "Refund policy",
+      "score": 0.91,
+      "snippet": "Refunds are available within 30 days."
+    },
+    {
+      "id": "doc-22",
+      "title": "Shipping policy",
+      "score": 0.64,
+      "snippet": "Standard shipping takes 3-5 days."
+    }
+  ],
+  "next_cursor": null
+}
+```
+
+The drill replayed 240 baseline responses through `selected_ids()` and ToolPulse's current `extract_shape`, `fingerprint`, and `shape_diff` functions.
+
+Results:
+
+- Baseline calls: 240.
+- Calls selecting `doc-17`: 240.
+- Calls returning an empty selection: 0.
+- Parser exceptions: 0.
+- Baseline fingerprint: `f4861736542b80a7`.
+
+## The drift
+
+The simulated provider changed the ranking payload:
+
+```diff
+ {
+   "query": "refund policy",
+   "documents": [{
+     "id": "doc-17",
+     "title": "Refund policy",
+-    "score": 0.91,
++    "relevance": {
++      "score": "0.91",
++      "model": "reranker-v3"
++    },
+     "snippet": "Refunds are available within 30 days."
+   }],
+   "next_cursor": null
+ }
+```
+
+The new representation may be reasonable for the provider. It is incompatible with the old consumer in two ways: the field moved and the numeric value became a string.
+
+The changed fingerprint was:
+
+```text
+f9a38c1e0cda5576
+```
+
+The current ToolPulse diff implementation produced:
+
+```text
+added:
+  documents[].relevance: object(2 keys)
+
+removed:
+  documents[].score: float
+
+changed:
+  none
+```
+
+The nested string type is represented inside the added object. The first useful signal is that the consumed top-level float disappeared.
+
+## What broke
+
+The drill replayed 40 changed responses through the unchanged adapter:
+
+- Changed calls: 40.
+- Calls selecting `doc-17`: 0.
+- Calls returning an empty selection: 40.
+- HTTP failures: 0.
+- JSON parse failures: 0.
+- Application exceptions: 0.
+
+The failure occurs here:
+
+```python
+doc.get("score", 0)
+```
+
+The changed payload has no top-level `score`, so `.get()` returns zero. `float(0)` is valid and falls below the 0.8 threshold. The adapter rejects a document with a provider relevance score of 0.91.
+
+From the agent's perspective, retrieval succeeded but found nothing useful. Depending on the surrounding prompt, the model may refuse to answer, provide a generic response, or answer from its pretrained knowledge without the current policy text.
+
+This is silent because the usual shallow checks pass:
+
+- The endpoint is reachable.
+- The status code is 200.
+- The body is valid JSON.
+- `documents` is still a list.
+- Each document still has an ID, title, and snippet.
+- The adapter returns a normal empty list.
+- No exception reaches the caller.
+
+A transport monitor reports healthy service. An exception tracker has nothing to record. A dashboard may eventually show fewer grounded answers, but it does not identify the changed field.
+
+## What ToolPulse caught
+
+The first changed response produces a new shape fingerprint and a bounded field-level diff:
+
+```text
+retrieval_search response shape changed
+baseline: f4861736542b80a7
+current:  f9a38c1e0cda5576
+added:    documents[].relevance: object(2 keys)
+removed:  documents[].score: float
+```
+
+That evidence narrows the diagnosis:
+
+1. **The transport path is healthy.** The call completed and returned JSON.
+2. **The contract changed.** A new structural fingerprint appeared.
+3. **The removed field matches the selector.** The adapter reads `documents[].score` directly.
+4. **A likely replacement is visible.** The new `relevance` object contains ranking information.
+5. **The user-facing symptom is explainable.** Every document now receives the adapter's default score of zero.
+
+The detector does not need to infer whether `relevance.score` is calibrated identically to the old score. That remains an integration decision. The reliability signal is that the established contract changed and the current adapter is no longer safe.
+
+A synthetic check should exercise the decision made by the consumer:
+
+```python
+response = retrieval_search("refund policy")
+ids = selected_ids(response)
+assert "doc-17" in ids
+```
+
+A probe that checks only HTTP, JSON parsing, or non-empty `documents` would pass. The known-document assertion fails on the first changed response.
+
+## The fix
+
+The immediate fix is to reject unknown score contracts instead of converting them into zero relevance. During a documented migration window, the adapter can support both forms explicitly:
+
+```python
+from typing import Any
+
+
+class RetrievalContractError(ValueError):
+    pass
+
+
+def read_score(document: dict[str, Any]) -> float:
+    if "score" in document:
+        raw_score = document["score"]
+        if isinstance(raw_score, bool) or not isinstance(raw_score, (int, float)):
+            raise RetrievalContractError("score must be numeric")
+        return float(raw_score)
+
+    relevance = document.get("relevance")
+    if isinstance(relevance, dict) and "score" in relevance:
+        raw_score = relevance["score"]
+        if not isinstance(raw_score, (int, float, str)) or isinstance(raw_score, bool):
+            raise RetrievalContractError("relevance.score must be numeric text or number")
+        try:
+            score = float(raw_score)
+        except ValueError as exc:
+            raise RetrievalContractError("relevance.score is not numeric") from exc
+
+        model = relevance.get("model")
+        if model != "reranker-v3":
+            raise RetrievalContractError(f"unsupported relevance model: {model!r}")
+        return score
+
+    raise RetrievalContractError("missing supported score contract")
+
+
+def selected_ids(response: dict[str, Any], threshold: float = 0.8) -> list[str]:
+    documents = response.get("documents")
+    if not isinstance(documents, list):
+        raise RetrievalContractError("documents must be a list")
+
+    return [
+        document["id"]
+        for document in documents
+        if read_score(document) >= threshold
+    ]
+```
+
+The compatibility code does not assume that any nested string should be trusted. It parses the score deliberately and checks the model identifier associated with the new representation. If the provider changes calibration or semantics, the adapter should require a reviewed mapping rather than silently comparing unlike values.
+
+The regression suite needs fixtures for:
+
+- the old numeric `score` contract;
+- the new nested string contract;
+- missing scores;
+- nonnumeric score strings;
+- unknown ranking models;
+- booleans, `NaN`, and infinite values;
+- empty and heterogeneous document lists.
+
+The production definition of tool success should occur after this validation. A response that cannot be normalized safely is a failed retrieval operation even when the remote server returned 200.
+
+This drill did not measure human time-to-resolution, so it would be misleading to publish a fabricated minute count. It verified the diagnostic sequence: the first changed payload yields a new fingerprint, the diff identifies the removed field used by the adapter, and a known-document synthetic check exposes the user impact.
+
+## What this argues for
+
+### Missing is not zero
+
+`doc.get("score", 0)` merges “the provider assigned zero relevance” with “the provider did not send the field.” Those states require different behavior.
+
+### Retrieval success is a consumer-level decision
+
+A search service can be available while the application receives no usable evidence. Define success after normalization and contract validation, not at the HTTP boundary.
+
+### Eval fixtures can hide live drift
+
+A frozen evaluation response containing `score` continues to pass after the live API moves the field. Keep offline evals, but add canaries that cross the current provider and adapter boundaries.
+
+### Structural and semantic checks complement each other
+
+The fingerprint detects the moved field. A semantic assertion verifies that a known policy query still selects `doc-17`. Either signal alone is less complete.
+
+### Reliability claims need provenance
+
+This was a controlled, reproducible drill using current code, not an invented customer incident. The evidence standard for reliability content should match the standard expected from the monitoring product itself.
