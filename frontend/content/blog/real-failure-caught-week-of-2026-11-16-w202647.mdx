@@ -1,0 +1,247 @@
+---
+title: "Real failure caught: week of 2026-11-16"
+slug: "real-failure-caught-week-of-2026-11-16-w202647"
+date: "2026-11-16"
+description: "A controlled ToolPulse SDK drill showing how duplicate response-shape traversal can add 108 ms of hidden caller latency and stall an asyncio loop."
+category: "case-study"
+tags: ['case-study', 'real-failure']
+author: "ToolPulse"
+generatedBy: "content-engine v1"
+---
+
+No verified live customer incident was available for publication this week. This post documents a controlled performance drill executed on November 16, 2026 against the current ToolPulse Python SDK source. The payloads and timing results came from that drill on one development machine, not customer traffic.
+
+The failure was inside the monitoring path: response-shape capture traversed the same object twice. A 5,000-item result added a median 107.82 ms to the caller while the recorded tool latency excluded that work. Moving the traversal to a thread improved event-loop responsiveness but did not improve total throughput.
+
+## The setup
+
+ToolPulse's Python `@monitor` wrapper measures the wrapped function, then records response structure in `finally:`:
+
+```python
+latency_ms = int((time.perf_counter() - start) * 1000)
+shape_tree = extract_shape(result)
+shape = fingerprint(result)
+reporter.record(
+    latency_ms=latency_ms,
+    output_shape=shape,
+    output_shape_tree=shape_tree,
+)
+```
+
+The `fingerprint()` helper performs its own extraction:
+
+```python
+def fingerprint(obj):
+    shape = extract_shape(obj)
+    canonical = json.dumps(shape, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode()).hexdigest()[:16]
+```
+
+For every successful call with shape capture enabled, the response is recursively traversed twice.
+
+The drill ran on:
+
+```text
+Python: 3.12.2
+CPU: Intel Core i5-8259U @ 2.30 GHz
+Date: 2026-11-16
+```
+
+The response was a prebuilt list of document objects. Each object contained scalar fields, nested metadata, labels, and two chunk objects. Prebuilding the payload removed document-generation time from the measurement.
+
+The benchmark compared:
+
+1. The current path: `extract_shape(result)` followed by `fingerprint(result)`.
+2. A one-pass path: extract once, serialize that shape, and hash it.
+3. A monitored function with `capture_shape=True`.
+4. The same function with `capture_shape=False`.
+5. Serial and four-thread execution.
+6. Inline and thread-offloaded inspection inside an asyncio loop.
+
+Each single-call timing used warmup iterations and 21 measured iterations. The event-loop test used eight inspections and a 5 ms heartbeat. These results characterize this machine and payload; they are not universal service-level targets.
+
+## The failure
+
+The current path did twice the recursive work needed to produce both the shape tree and fingerprint.
+
+Measured results:
+
+| Items | Current p50 | Current p95 | One-pass p50 | One-pass p95 |
+|---|---:|---:|---:|---:|
+| 100 | 2.14 ms | 2.25 ms | 1.08 ms | 1.19 ms |
+| 1,000 | 21.53 ms | 21.87 ms | 10.72 ms | 10.84 ms |
+| 5,000 | 108.76 ms | 125.07 ms | 54.38 ms | 60.34 ms |
+
+The p50 ratio was 1.98x, 2.01x, and 2.00x as the payload grew. The result matches the implementation: the dominant recursive traversal ran twice.
+
+The monitored-function test made the user-visible effect clearer. The function itself returned a prebuilt object and performed no meaningful work.
+
+```text
+capture_shape=True  p50: 107.8198 ms
+capture_shape=False p50:   0.0018 ms
+added wall time:          107.8179 ms
+```
+
+The tool's recorded `latency_ms` was calculated before shape extraction. The caller waited for the extraction, but the tool-latency metric did not include it.
+
+That creates two operational problems:
+
+1. The monitor can add latency that its own dashboard does not attribute to instrumentation.
+2. A team investigating slow requests may see a fast tool span even though the wrapped call returns more than 100 ms later.
+
+## What broke
+
+The first user-facing symptom is tail latency. A tool that obtains a large search, catalog, or analytics response can return quickly, then remain inside the wrapper while the monitor walks the result twice.
+
+For synchronous code, the caller simply waits.
+
+For asyncio code, the `finally:` block runs on the event-loop thread. Timers, socket callbacks, and unrelated coroutines wait while shape extraction completes.
+
+The drill's eight-call asyncio test produced:
+
+```text
+inline inspection total:             853.13 ms
+inline maximum heartbeat lag:        310.55 ms
+
+asyncio.to_thread total:             854.86 ms
+to_thread maximum heartbeat lag:      72.83 ms
+```
+
+Moving the work to a thread reduced the longest observed heartbeat delay, but total completion time stayed effectively unchanged.
+
+The reason appeared in the CPU-throughput test:
+
+```text
+16 jobs, serial:       340.83 ms
+16 jobs, four threads: 338.19 ms
+thread speedup:           1.01x
+```
+
+The recursive traversal is Python CPU work. On this standard GIL-enabled CPython build, four threads did not provide useful parallel throughput.
+
+This failure is easy to miss because common health checks still pass:
+
+- The wrapped function returns the correct value.
+- No exception reaches the caller.
+- The reporter's network work remains in a background thread.
+- The fingerprint is correct.
+- The recorded tool latency can remain low.
+- Unit tests that use small dictionaries complete quickly.
+
+The defect is not correctness of the fingerprint. It is unbounded duplicate work on the caller's return path.
+
+## What ToolPulse caught
+
+This drill used wall-clock and scheduler-lag measurements around ToolPulse rather than telemetry emitted by ToolPulse. That distinction matters because the current tool-latency field stops before fingerprinting begins.
+
+The useful signals were:
+
+1. **Wall time around the decorated call.** The function returned a prebuilt object, so the 107.82 ms difference belonged to instrumentation.
+2. **Capture disabled as a control.** Turning off shape capture reduced median time to approximately 0.002 ms.
+3. **A one-pass implementation.** Reusing the extracted shape cut median processing time almost exactly in half.
+4. **Event-loop heartbeat lag.** Inline processing delayed unrelated loop work by hundreds of milliseconds in the test.
+5. **Thread throughput.** Four threads did not reduce total CPU time, which ruled out “increase the thread count” as the primary fix.
+
+A production monitor should emit its own local-cost fields:
+
+```text
+tool_latency_ms
+instrumentation_ms
+shape_capture_ms
+export_queue_age_ms
+response_items_inspected
+response_items_skipped
+```
+
+Without those fields, monitoring overhead can appear as unattributed application latency.
+
+## The fix
+
+The immediate change validated in the drill harness was to extract once and fingerprint the extracted shape:
+
+```python
+import hashlib
+import json
+
+
+def fingerprint_shape(shape: object) -> str:
+    canonical = json.dumps(shape, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode()).hexdigest()[:16]
+
+
+def inspect_result(result: object) -> tuple[object, str]:
+    shape = extract_shape(result)
+    return shape, fingerprint_shape(shape)
+```
+
+That reduced the 5,000-item median from 108.76 ms to 54.38 ms without changing the resulting shape semantics.
+
+It is only the first fix. Fifty-four milliseconds is still too much inline work for many agent services. The production design should also:
+
+### 1. Bound traversal
+
+Apply maximum depth, maximum list elements, maximum object keys, and a total inspection budget. Record that the shape was sampled or truncated.
+
+```python
+shape = extract_shape(
+    result,
+    max_depth=12,
+    max_list_items=100,
+    max_object_keys=200,
+)
+```
+
+A homogeneous 50,000-row response should not require inspecting all 50,000 rows to establish a stable structure.
+
+### 2. Separate tool latency from instrumentation latency
+
+Capture the tool end time before monitoring work, then capture the wrapper return time after monitoring work.
+
+```python
+tool_end = time.perf_counter()
+shape_tree, shape_hash = inspect_result(result)
+return_end = time.perf_counter()
+
+record(
+    tool_latency_ms=(tool_end - start) * 1000,
+    instrumentation_ms=(return_end - tool_end) * 1000,
+)
+```
+
+### 3. Move large inspections across a real execution boundary
+
+A background thread can protect event-loop responsiveness, but the benchmark showed no CPU-throughput gain. Sustained large-response inspection may require a process pool, a native implementation that releases the GIL, or a cheaper sampling policy.
+
+### 4. Use a bounded queue
+
+Do not let slow analysis or collector failure create unlimited memory growth. Drop, sample, or spill according to an explicit policy and expose counters for each loss mode.
+
+### 5. Test realistic response sizes
+
+The existing unit tests prove that wrappers preserve return values and exceptions. Add performance regression cases for 100, 1,000, and 5,000 nested items, plus an asyncio heartbeat budget.
+
+The drill harness identified and validated the duplicate-traversal fix in under an hour. No production SDK change is claimed in this post; the repository should receive a separate reviewed patch with compatibility tests and release notes.
+
+## What this argues for
+
+### Monitoring needs its own latency budget
+
+“Never blocks on network I/O” is necessary but incomplete. CPU work before enqueue can still block the caller.
+
+### Async is not a location
+
+Calling an async exporter does not move synchronous serialization or hashing off the event loop. `asyncio.to_thread` changes responsiveness, not necessarily throughput.
+
+### The GIL changes the fix
+
+A Python thread is a good home for network export. It is not automatically a good scaling strategy for recursive object traversal.
+
+### Metrics need boundary definitions
+
+A field named `latency_ms` should state whether it measures the wrapped dependency, the full decorated call, or end-to-end export. Different boundaries answer different incident questions.
+
+### Correct telemetry can still be operationally wrong
+
+Every fingerprint in this drill was correct. The failure was that producing it consumed more than 100 ms on the caller's return path and hid that cost from the primary latency field.
+
+Observability code has to meet the same standard it applies to the application: bounded work, explicit backpressure, measurable overhead, and evidence that the detector does not become the incident.
