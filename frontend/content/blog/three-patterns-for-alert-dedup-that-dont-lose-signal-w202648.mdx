@@ -1,0 +1,257 @@
+---
+title: "Three patterns for alert dedup that don't lose signal"
+slug: "three-patterns-for-alert-dedup-that-dont-lose-signal-w202648"
+date: "2026-11-23"
+description: "Three implementation patterns that reduce repeated pages while preserving event counts, severity changes, recoveries, and novel failure evidence."
+category: "deep-dive"
+tags: ['deep-dive', 'engineering']
+author: "ToolPulse"
+generatedBy: "content-engine v1"
+---
+
+Alert deduplication should compress repeated notifications, not repeated evidence. The event stream must retain the count, timing, dimensions, and severity of every qualifying observation. Deduplication belongs between incident state and human delivery, where it can suppress redundant messages without making the underlying failure disappear.
+
+Three patterns work well for agent-tool monitoring: versioned semantic fingerprints, transition-based notification budgets, and separate lanes for recurrence, recovery, and novelty.
+
+## Pattern 1: build a versioned semantic fingerprint
+
+A dedup key should identify the operationally same failure. Raw error text almost never does.
+
+This key is too specific:
+
+```text
+production|external_search|timeout after 5001 ms|request=8f2c...
+```
+
+The request ID and measured duration make every event unique.
+
+This key is too broad:
+
+```text
+production|external_search|failed
+```
+
+It collapses authentication errors, timeouts, rate limits, provider 500s, and contract drift into one incident.
+
+Use bounded dimensions that reflect ownership and probable cause:
+
+- environment
+- tool name
+- agent or workflow class, when ownership differs
+- normalized failure class
+- changed contract path or response-shape fingerprint
+- provider region or deployment version, when actionable
+- dedup-policy version
+
+```python
+from dataclasses import dataclass
+from hashlib import sha256
+
+
+@dataclass(frozen=True)
+class Failure:
+    environment: str
+    tool: str
+    failure_class: str
+    contract_path: str = "none"
+    provider_region: str = "global"
+
+
+def incident_key(event: Failure, policy_version: str = "v3") -> str:
+    dimensions = (
+        policy_version,
+        event.environment.strip().lower(),
+        event.tool.strip().lower(),
+        event.failure_class.strip().lower(),
+        normalize_path(event.contract_path),
+        event.provider_region.strip().lower(),
+    )
+    canonical = "|".join(dimensions)
+    return sha256(canonical.encode()).hexdigest()[:20]
+
+
+def normalize_path(path: str) -> str:
+    # results[17].price and results[842].price are the same contract path.
+    import re
+    return re.sub(r"\[\d+\]", "[]", path.strip().lower())
+```
+
+Store the canonical dimensions next to the hash. The hash is an index, not an explanation.
+
+Version the policy because grouping rules change. If `timeout` is later split into `connect_timeout` and `read_timeout`, a versioned key prevents new semantics from being silently attached to an old incident.
+
+The fingerprint should omit high-cardinality values such as request IDs, account IDs, timestamps, complete URLs, raw prompts, and exception messages. Preserve those values on the event record for investigation. Do not promote them into the incident key.
+
+A useful test is counterfactual: if two events share a key, would the same on-call owner take the same first action? If not, the key is too broad.
+
+## Pattern 2: notify on state transitions and milestones
+
+A cooldown timer answers only one question: “has enough time passed since the last page?” It does not answer whether the incident became worse, affected more users, recovered, or returned.
+
+Model an incident as state plus counters:
+
+```text
+new -> active -> escalated -> recovering -> resolved
+                    |                         |
+                    +-------- reopened <-----+
+```
+
+Every event updates the incident. Notifications occur only on meaningful transitions or milestones.
+
+A policy for `external_search` might be:
+
+- open after 5 failures in 2 minutes with at least 20 total calls;
+- escalate at 25% failure rate or 10 affected sessions;
+- escalate again if duration reaches 15 minutes;
+- notify when a second failure class appears;
+- enter recovery after 3 healthy synthetic probes;
+- resolve after 10 healthy minutes and at least 50 successful calls;
+- reopen if the same fingerprint fails again within 24 hours.
+
+During a 20-minute outage, 12,000 failed calls might produce four notifications:
+
+1. incident opened;
+2. impact threshold crossed;
+3. prolonged-duration milestone crossed;
+4. incident resolved.
+
+The event store still contains all 12,000 failures. The incident summary still reports the full exposure. Only the delivery count is reduced.
+
+A compact implementation can use monotonic milestones:
+
+```python
+MILESTONES = [1, 10, 100, 1_000, 10_000]
+
+
+def crossed_milestone(previous_count: int, current_count: int) -> int | None:
+    for milestone in MILESTONES:
+        if previous_count < milestone <= current_count:
+            return milestone
+    return None
+```
+
+Count milestones alone are not enough. Evaluate multiple dimensions:
+
+- failure rate with a minimum denominator;
+- affected sessions or accounts;
+- elapsed incident duration;
+- p95 or p99 latency;
+- synthetic-check status;
+- new contract paths;
+- transition from partial to complete failure;
+- notification-delivery failure.
+
+The important rule is monotonic evidence. A worsening incident should never be silenced merely because a notification was sent three minutes ago.
+
+Use event time for incident semantics and ingestion time for pipeline health. A late event may increase the historical count without reopening a resolved incident. If out-of-order events are common, define an explicit lateness window rather than letting arrival order decide incident state.
+
+## Pattern 3: use separate lanes for recurrence, recovery, and novelty
+
+One suppression bucket cannot safely handle all event types.
+
+A repeated timeout, a successful recovery probe, and a new schema change are not equivalent messages even when they concern the same tool. Give them separate lanes.
+
+### Repeat lane
+
+Matching events update counts and impact summaries without sending another page. A rolling Slack summary can still report progress every five or ten minutes.
+
+### Novelty lane
+
+A new failure class, contract path, provider region, or deployment version can bypass repeat suppression. This prevents a timeout incident from hiding a simultaneous authentication failure.
+
+Novelty needs limits. An upstream service that emits a unique exception string on every request can otherwise create an alert storm. Classify first, then admit a bounded number of new variants per window.
+
+One practical rule is:
+
+```text
+allow the first 3 novel variants per incident per 15 minutes;
+aggregate the rest as "17 additional variants";
+always preserve the underlying events.
+```
+
+### Recovery lane
+
+Healthy evidence should not be deduplicated as if it were another failure. Recovery has its own admission policy: consecutive successful probes, a healthy-rate threshold, or a quiet interval.
+
+A single success after 500 failures is not recovery. Requiring three successful synthetic checks at one-minute intervals gives six minutes of evidence from the last failure to resolution. For high-volume tools, a statistically meaningful success window may be better than consecutive probes.
+
+### Recurrence lane
+
+A failure after resolution is operationally different from another event during the same incident. Reopen the prior incident or create a linked recurrence according to a bounded recurrence window.
+
+For example:
+
+- recurrence within 30 minutes: reopen the same incident;
+- recurrence within 24 hours: create a linked incident marked `repeat_failure`;
+- recurrence after 24 hours: create a new incident with prior-history context.
+
+This preserves a useful distinction between flapping and an unrelated future outage.
+
+## Keep events, incidents, and notifications separate
+
+The three patterns depend on a simple data-model boundary:
+
+1. **Event:** one call, drift observation, health-check result, or exporter failure.
+2. **Incident:** stateful grouping of related events.
+3. **Notification:** a delivery attempt for an incident transition or summary.
+
+Do not use the notification table as the event store. If the only retained row says “search is failing,” responders cannot calculate the failure rate, reconstruct the exposure window, or inspect variants that were suppressed.
+
+A useful incident summary can remain compact:
+
+```text
+external_search / production / read_timeout
+opened:        14:02:11 UTC
+last event:    14:18:44 UTC
+failed calls:  1,842 / 9,610 (19.2%)
+affected runs: 73
+regions:       us-east-1, us-west-2
+variants:      3 admitted, 17 aggregated
+synthetics:    4 failed, then 3 healthy
+state:         resolved
+```
+
+Every number should be derivable from retained events or durable aggregates.
+
+## Test the deduplicator with adversarial sequences
+
+Repeated identical events are the easiest case. Test sequences that attack the grouping assumptions:
+
+- timeout, then authentication failure on the same tool;
+- production and staging failures with identical text;
+- a low-volume failure becoming high-volume;
+- recovery, recurrence, recovery, recurrence;
+- events arriving after resolution;
+- a deployment changing the contract fingerprint;
+- notification delivery failing while incident processing succeeds;
+- a flood of high-cardinality exception variants;
+- a provider-region failure hidden by a healthy global average.
+
+Track the deduplicator itself:
+
+```text
+qualifying_events_total
+incidents_opened_total
+incidents_reopened_total
+incident_transitions_total
+novel_variants_admitted_total
+novel_variants_aggregated_total
+notifications_attempted_total
+notifications_delivered_total
+notifications_suppressed_total
+unclassified_events_total
+```
+
+A conservation check should explain every qualifying event as grouped, ignored by policy, rejected as invalid, or delayed. “Dropped because dedup” is not an acceptable unexplained bucket.
+
+## Where this advice does not apply
+
+A low-volume internal script may need only a threshold and a short cooldown. The incident machinery can cost more than the operational risk.
+
+Batch jobs often group by run ID rather than time. Six hours of errors from one import may belong to one job incident even when a time-window policy would split it.
+
+Security detections require stricter treatment. Two similar events may involve different actors, targets, or credentials. Do not deduplicate away forensic identity.
+
+Finally, deduplication cannot repair a bad detector. If harmless optional fields trigger contract alerts, classify compatibility correctly before extending the suppression window.
+
+ToolPulse can supply the tool identity, latency, failure class, response-shape fingerprint, field-level diff, and synthetic-check status needed for these policies. The implementation principle remains product-independent: retain observations, group by operational cause, and suppress only redundant human delivery.
