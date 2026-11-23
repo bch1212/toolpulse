@@ -1,0 +1,265 @@
+---
+title: "Real failure caught: week of 2026-11-23"
+slug: "real-failure-caught-week-of-2026-11-23-w202648"
+date: "2026-11-23"
+description: "A controlled ToolPulse TypeScript SDK drill showing how a second partial configure call can erase the API key and silently stop telemetry export."
+category: "case-study"
+tags: ['case-study', 'real-failure']
+author: "ToolPulse"
+generatedBy: "content-engine v1"
+---
+
+No verified live customer incident was available for publication this week. This post documents a controlled configuration drill executed on November 23, 2026 against the ToolPulse TypeScript SDK at repository commit `0887812`. The test used a local fetch spy and a non-secret probe key. It did not send customer data or contact the production collector.
+
+The failure was deterministic: calling `configure()` twice with partial overrides erased values set by the first call. In the tested sequence, the second call reset the API key to its default empty value. The reporter then discarded the record without an exception, warning, queue entry, or network request.
+
+## The setup
+
+The TypeScript SDK keeps reporter configuration in module state:
+
+```typescript
+const DEFAULTS: Required<ReporterConfig> = {
+  apiKey: process.env.TOOLPULSE_API_KEY ?? "",
+  endpoint: process.env.TOOLPULSE_ENDPOINT ?? "https://api.toolpulse.io",
+  batchSize: 50,
+  flushIntervalMs: 5000,
+  enabled: true,
+};
+
+let cfg: Required<ReporterConfig> = { ...DEFAULTS };
+```
+
+Applications can override individual fields:
+
+```typescript
+configure({ apiKey: process.env.TOOLPULSE_API_KEY });
+configure({ endpoint: process.env.OBSERVABILITY_COLLECTOR });
+```
+
+That sequence is plausible in a real service. A shared bootstrap module may load credentials, while an environment-specific module sets the collector URL later.
+
+The implementation under test merged configuration like this:
+
+```typescript
+export function configure(overrides: ReporterConfig): void {
+  cfg = { ...cfg, ...DEFAULTS, ...overrides };
+}
+```
+
+Object-spread order is left to right. `DEFAULTS` overwrote the current `cfg` before the new partial override was applied.
+
+The drill built the current package, replaced global `fetch` with a spy, and submitted the same synthetic tool-call record under two configurations.
+
+Sequence A used two partial calls:
+
+```typescript
+configure({
+  apiKey: "probe-key",
+  batchSize: 1,
+  flushIntervalMs: 60_000,
+});
+configure({ endpoint: "https://collector.example" });
+
+getReporter().record(probeRecord);
+```
+
+Sequence B supplied all required fields atomically:
+
+```typescript
+configure({
+  apiKey: "probe-key",
+  endpoint: "https://collector.example",
+  batchSize: 1,
+  flushIntervalMs: 60_000,
+});
+
+getReporter().record(probeRecord);
+```
+
+The fetch spy recorded destination, API-key header, and batch size. It did not retain payload values.
+
+## The failure
+
+Measured result:
+
+```text
+split configure calls:  0 POST requests
+single configure call:   1 POST request
+single-call destination: https://collector.example/ingest
+single-call batch size:  1 record
+```
+
+The first call set `apiKey` to `probe-key` and `batchSize` to `1`.
+
+The second call evaluated this merge:
+
+```typescript
+cfg = {
+  ...cfg,       // apiKey="probe-key", batchSize=1
+  ...DEFAULTS,  // apiKey="",          batchSize=50
+  ...overrides, // endpoint="https://collector.example"
+};
+```
+
+The final configuration contained the new endpoint, but the API key returned to the environment default. In the drill environment that default was empty.
+
+The reporter's hot path then did exactly what its code requested:
+
+```typescript
+record(rec: ToolCallRecord): void {
+  if (!cfg.enabled || !cfg.apiKey) return;
+  this.queue.push(rec);
+  if (this.queue.length >= cfg.batchSize) this.flush();
+}
+```
+
+Because `cfg.apiKey` was empty, `record()` returned before queueing the event. No fetch occurred.
+
+## What broke
+
+The immediate symptom was missing telemetry after a valid configuration sequence. The monitored function still returned normally. Application logs remained clean. The reporter did not attempt delivery, so collector-side metrics and network traces had nothing to show.
+
+The same merge order can reset more than the API key:
+
+- a custom endpoint can revert to `https://api.toolpulse.io`;
+- a small batch size can revert to `50`;
+- a custom flush interval can revert to `5000` ms;
+- `enabled: false` can revert to `true`;
+- any future configuration field can acquire the same behavior.
+
+This is more dangerous than a startup exception because it creates false confidence. The application believes monitoring is configured. The wrapper continues to run. The absence of events can look like healthy traffic, an idle service, a collector problem, or an API-key problem.
+
+A common operational sequence would be:
+
+```typescript
+configure({ apiKey: secretStore.read("toolpulse") });
+// Later, after tenant or environment discovery:
+configure({ endpoint: regionalCollector });
+```
+
+The second call silently disables collection when no environment API key exists. If an environment API key does exist, it can silently switch credentials instead. Either result violates the expected semantics of a partial update.
+
+## What caught it
+
+This drill used an exporter spy around ToolPulse rather than telemetry emitted by ToolPulse. That distinction matters: the defect prevents the telemetry event from entering the queue.
+
+Five signals isolated the failure:
+
+1. **A split-versus-atomic control.** The same record exported when configuration was supplied in one call.
+2. **A fetch spy.** The split sequence produced zero delivery attempts, ruling out collector rejection.
+3. **An empty queue path.** The early return occurred before `queue.push()`.
+4. **Spread-order inspection.** `DEFAULTS` appeared after `cfg`, so it replaced prior overrides.
+5. **A one-line candidate fix.** Removing the second default spread changed the split sequence from zero POSTs to one.
+
+The existing TypeScript suite passed 11 tests after the candidate fix. The suite covered schema hashing and monitor behavior, but it did not contain a multi-call configuration regression case.
+
+## The fix
+
+Partial configuration should merge into the current configuration, not recreate defaults on every call:
+
+```typescript
+export function configure(overrides: ReporterConfig): void {
+  cfg = { ...cfg, ...overrides };
+}
+```
+
+Defaults are already applied when `cfg` is initialized. Reapplying them during each update is unnecessary.
+
+The drill rebuilt the package with that one-line change and reran Sequence A:
+
+```text
+split configure calls after fix: 1 POST request
+fixed destination:                https://collector.example/ingest
+fixed API-key header:             probe-key
+fixed batch size:                 1 record
+```
+
+The reproduction and candidate-fix validation took under ten minutes. No production SDK change is claimed in this post; the repository should receive a separate reviewed patch and release process.
+
+The permanent regression test should assert configuration composition rather than only the final happy path:
+
+```typescript
+it("preserves prior overrides across partial configure calls", async () => {
+  configure({ apiKey: "probe-key", batchSize: 1 });
+  configure({ endpoint: "https://collector.example" });
+
+  getReporter().record(probeRecord);
+  await nextTurn();
+
+  expect(fetch).toHaveBeenCalledTimes(1);
+  expect(fetch).toHaveBeenCalledWith(
+    "https://collector.example/ingest",
+    expect.objectContaining({
+      headers: expect.objectContaining({
+        "X-API-Key": "probe-key",
+      }),
+    }),
+  );
+});
+```
+
+Add a small configuration matrix:
+
+- API key, then endpoint;
+- endpoint, then API key;
+- disabled, then endpoint;
+- batch size, then API key;
+- three successive partial updates;
+- explicit reset semantics, if resetting is supported;
+- configuration before and after reporter construction.
+
+The last case matters because the reporter's interval timer is created once. Preserving a changed `flushIntervalMs` in `cfg` does not automatically recreate an already-running timer. That is a separate lifecycle decision and should be documented or tested explicitly.
+
+## Operational guardrails
+
+A telemetry SDK that promises to fail open needs evidence when it fails open. It must not crash the application, but it should expose enough local state to distinguish “no monitored calls” from “monitoring disabled itself.”
+
+Useful diagnostics include:
+
+```text
+records_accepted_total
+records_dropped_total{reason="disabled"}
+records_dropped_total{reason="missing_api_key"}
+export_attempts_total
+export_failures_total
+queue_depth
+last_successful_export_at
+configuration_revision
+```
+
+Those counters can be exposed through a debug hook, callback, or local metrics integration without logging secrets.
+
+A startup self-check can also validate configuration without sending customer payloads:
+
+```typescript
+const status = toolpulse.diagnostics();
+assert(status.enabled);
+assert(status.hasApiKey);
+assert(status.endpoint.startsWith("https://"));
+```
+
+Do not return the key itself. Return presence, source, and a non-secret configuration revision.
+
+## What this argues for
+
+### Partial-update APIs need partial-update tests
+
+The bug was not in TypeScript object spread. It was in a mismatch between the public API's apparent semantics and the merge order. If callers can pass partial fields, tests must compose multiple partial calls.
+
+### Fail-open behavior needs local observability
+
+Suppressing monitoring exceptions protects the application. Suppressing all evidence of disabled monitoring protects the defect.
+
+### Zero telemetry is not a healthy signal
+
+Collectors and dashboards need an expected-traffic or heartbeat model. An empty chart cannot distinguish a quiet service from a broken exporter.
+
+### Configuration is runtime state
+
+Treat it like any other state machine: define initialization, updates, resets, concurrency, and lifecycle effects. A one-line merge deserves the same adversarial testing as a queue or retry loop.
+
+### Monitoring code can fail before the network
+
+Collector uptime, HTTP retries, and ingest dashboards would not have found this problem. The record vanished before serialization. SDK health must measure accepted, queued, exported, and dropped records as separate stages.
+
+The controlled drill found a small line with a large failure mode: a second valid-looking configuration call could turn monitoring off while every monitored function continued to work. Reliability tooling needs tests for its own silent paths, especially the paths intentionally designed not to raise.
